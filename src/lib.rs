@@ -19,5 +19,9 @@ pub enum VirtIOError {
     /// 虚拟队列已经被占用
     QueueInUsed(usize),
     /// 非法参数
-    InvalidParameter
+    InvalidParameter,
+    /// 溢出
+    Overflow,
+    /// 已用环没准备好
+    UsedRingNotReady
 }

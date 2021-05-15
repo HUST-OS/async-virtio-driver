@@ -4,7 +4,7 @@
 
 use volatile::Volatile;
 use bitflags::bitflags;
-use core::mem::size_of;
+use core::{mem::size_of, sync::atomic::{fence, Ordering}};
 use crate::util::align_up_page;
 
 use super::dma::DMA;
@@ -31,7 +31,7 @@ pub struct VirtQueue<'virtio> {
     queue_index: u32,
     /// 虚拟队列长度
     queue_size: u16,
-    /// 已经使用的队列项目数
+    /// 已经使用的描述符数目
     used_num: u16,
     /// 空闲描述符链表头
     /// 初始时所有描述符通过 next 指针依次相连形成空闲链表
@@ -93,7 +93,104 @@ impl VirtQueue<'_> {
         })
     }
 
-    
+    /// 添加 buffers 到虚拟队列，返回一个 token
+    pub fn add_buf(&mut self, inputs: &[&[u8]], outputs: &[&mut [u8]]) -> Result<u16> {
+        if inputs.is_empty() && outputs.is_empty() {
+            return Err(VirtIOError::InvalidParameter);
+        }
+        if inputs.len() + outputs.len() + self.used_num as usize > self.queue_size as usize {
+            // buffer 数量溢出
+            return Err(VirtIOError::Overflow);
+        }
+
+        // 从空闲描述符表中分配描述符
+        let head = self.free_desc_head;
+        let mut tail = self.free_desc_head;
+        inputs.iter().for_each(|input| {
+            let desc = &mut self.descriptor_table[self.free_desc_head as usize];
+            // 将 buffer 的信息写入描述符
+            desc.set_buf(input);
+            // 设置描述符的标识位
+            desc.flags.write(DescriptorFlags::NEXT);
+            tail = self.free_desc_head;
+            self.free_desc_head = desc.next.read();
+        });
+        outputs.iter().for_each(|output| {
+            let desc = &mut self.descriptor_table[self.free_desc_head as usize];
+            desc.set_buf(output);
+            desc.flags.write(DescriptorFlags::NEXT | DescriptorFlags::WRITE);
+            tail = self.free_desc_head;
+            self.free_desc_head = desc.next.read();
+        });
+        // 清除描述符链的最后一个元素的 next 指针
+        {
+            let desc = &mut self.descriptor_table[tail as usize];
+            let mut flags = desc.flags.read();
+            flags.remove(DescriptorFlags::NEXT);
+            desc.flags.write(flags);
+        }
+        // 更新已使用描述符数目
+        self.used_num += (inputs.len() + outputs.len()) as u16;
+
+        // 将描述符链的头部放入可用环中
+        let avail_slot = self.avail_index & (self.queue_size - 1);
+        self.avail_ring.ring[avail_slot as usize].write(head);
+        
+        // write barrier(内存屏障操作？)
+        fence(Ordering::SeqCst);
+
+        // 更新可用环的头部
+        self.avail_index = self.avail_index.wrapping_add(1);
+        self.avail_ring.idx.write(self.avail_index);
+        Ok(head)
+    }
+
+    /// 是否可以从可用环中弹出没处理的项
+    pub fn can_pop(&self) -> bool {
+        self.last_used_index != self.used_ring.idx.read()
+    }
+
+    /// 可用的空闲描述符数量
+    pub fn free_desc_num(&self) -> usize {
+        (self.queue_size - self.used_num) as usize
+    }
+
+    /// 回收描述符
+    /// 该方法将会把需要回收的描述符链放到空闲描述符链的头部
+    fn recycle_descriptors(&mut self, mut head: u16) {
+        let origin_desc_head = self.free_desc_head;
+        self.free_desc_head = head;
+        loop {
+            let desc = &mut self.descriptor_table[head as usize];
+            let flags = desc.flags.read();
+            self.used_num -= 1;
+            if flags.contains(DescriptorFlags::NEXT) {
+                head = desc.next.read();
+            } else {
+                desc.next.write(origin_desc_head);
+                return;
+            }
+        }
+    }
+
+    /// 从已用环中获取一个 token，并返回长度
+    /// ref: linux virtio_ring.c virtqueue_get_buf_ctx
+    pub fn pop_used(&mut self) -> Result<(u16, u32)> {
+        if !self.can_pop() {
+            return Err(VirtIOError::UsedRingNotReady);
+        }
+        // read barrier
+        fence(Ordering::SeqCst);
+
+        let last_used_slot = self.last_used_index &  (self.queue_size - 1);
+        let index = self.used_ring.ring[last_used_slot as usize].id.read() as u16;
+        let len = self.used_ring.ring[last_used_slot as usize].len.read();
+
+        self.recycle_descriptors(index);
+        self.last_used_index = self.last_used_index.wrapping_add(1);
+
+        Ok((index, len))
+    }
 }
 
 /// 虚拟队列内存布局信息
@@ -138,6 +235,28 @@ pub struct Descriptor {
     next: Volatile<u16>
 }
 
+impl Clone for Descriptor {
+    fn clone(&self) -> Self {
+        Self {
+            paddr : Volatile::<u64>::new(self.paddr.read()),
+            len : Volatile::<u32>::new(self.len.read()),
+            flags : Volatile::<DescriptorFlags>::new(self.flags.read()),
+            next : Volatile::<u16>::new(self.next.read()),
+        }
+    }
+}
+
+impl Descriptor {
+    /// 把特定 buffer 的信息写入到描述符
+    fn set_buf(&mut self, buf: &[u8]) {
+        let buf_paddr = unsafe {
+            virtio_virt_to_phys(buf.as_ptr() as usize) as u64
+        };
+        self.paddr.write(buf_paddr);
+        self.len.write(buf.len() as u32);
+    }
+}
+
 bitflags! {
     /// 描述符的标识
     struct DescriptorFlags: u16 {
@@ -167,4 +286,8 @@ struct Ring<Entry: Sized> {
 struct UsedElement {
     id: Volatile<u32>,
     len: Volatile<u32>
+}
+
+extern "C" {
+    fn virtio_virt_to_phys(vaddr: usize) -> usize;
 }
