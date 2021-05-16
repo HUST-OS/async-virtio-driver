@@ -55,6 +55,9 @@ impl Future for DMAAllocFuture {
     }
 }
 
+unsafe impl Send for DMAAllocFuture {}
+unsafe impl Sync for DMAAllocFuture {}
+
 impl DMA {
     // 先用这种方式创建 DMA，后面考虑使用 alloc 方法
     pub fn new(pages: usize) -> Result<Self> {

@@ -7,12 +7,15 @@ mod log;
 mod config;
 mod util;
 mod dma;
-mod queue;
-mod mmio;
-mod block;
+pub mod queue;
+pub mod mmio;
+pub mod block;
 
 pub type Result<T = ()> = core::result::Result<T, VirtIOError>;
 
+// pub use mmio::*;
+// pub use queue::*;
+// pub use block::*;
 /// 虚拟设备错误
 #[derive(Debug)]
 pub enum VirtIOError {

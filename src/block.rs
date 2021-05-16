@@ -28,6 +28,7 @@ impl Future for BlockFuture<'_> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.queue.can_pop() {
             true => {
+                // println!("[virtio] poll in BlockFuture, return ready");
                 self.queue.pop_used()?;
                 match self.response.status {
                     BlockRespStatus::Ok => Poll::Ready(Ok(())),
@@ -37,11 +38,15 @@ impl Future for BlockFuture<'_> {
             false => {
                 // 这里不进行唤醒，直接返回 pending
                 // 外部中断到来的时候在内核里面唤醒
+                // println!("[vitio] poll in BlockFuture, return pending");
                 Poll::Pending
             }
         }
     }
 }
+
+unsafe impl Send for BlockFuture<'_> {}
+unsafe impl Sync for BlockFuture<'_> {}
 
 /// 虚拟块设备
 /// 读写请求放在虚拟队列里面并会被设备处理
@@ -90,6 +95,40 @@ impl<'blk> VirtIOBlock<'blk> {
         })
     }
 
+    pub fn new(header: &'blk mut VirtIOHeader) -> Result<Self> {
+        if !header.verify() {
+            return Err(VirtIOError::HeaderVerifyError);
+        }
+        header.begin_init(|f| {
+            let features = BlockFeature::from_bits_truncate(f);
+            println!("[virtio] block device features: {:?}", features);
+            // 对这些 features 进行谈判
+            let supported_featuers = BlockFeature::empty();
+            (features & supported_featuers).bits()
+        });
+
+        // 读取配置空间
+        let config = unsafe {
+            &mut *(header.config_space() as *mut BlockConfig)
+        };
+        println!("[virtio] config: {:?}", config);
+        println!(
+            "[virtio] found a block device of size {} KB",
+            config.capacity.read() / 2
+        );
+
+        let queue = VirtQueue::new(
+            header, 0, VIRT_QUEUE_SIZE as u16
+        )?;
+
+        header.finish_init();
+
+        Ok(VirtIOBlock {
+            header,
+            queue,
+            capacity: config.capacity.read() as usize
+        })
+    }
     /// 通知设备 virtio 外部中断已经处理完成
     pub fn ack_interrupt(&mut self) -> bool {
         self.header.ack_interrupt()
@@ -118,7 +157,7 @@ impl<'blk> VirtIOBlock<'blk> {
     }
 
     /// 以异步方式写入一个块
-    pub fn async_write(&'blk mut self, block_id: usize, buf: &'blk mut [u8]) -> BlockFuture {
+    pub fn async_write(&'blk mut self, block_id: usize, buf: &'blk [u8]) -> BlockFuture {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
@@ -158,7 +197,7 @@ impl<'blk> VirtIOBlock<'blk> {
 }
 
 bitflags! {
-    struct BlockFeature: u64 {
+    struct BlockFeature: u64 { 
         /// Device supports request barriers. (legacy)
         const BARRIER       = 1 << 0;
         /// Maximum size of any single segment is in `size_max`.
