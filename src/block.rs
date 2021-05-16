@@ -18,30 +18,40 @@ pub struct BlockFuture<'blk> {
     /// 0 表示读，1 表示写
     _req_type: u8,
     /// 该块设备的虚拟队列，用于 poll 操作的时候判断请求是否完成
-    queue: &'blk mut VirtQueue<'blk>,
+    queue: &'blk mut VirtQueue,
     /// 块设备的回应，用于 poll 操作的时候从这里读取请求被处理的状态
+    // todo: 这里可能需要用 spin 定住内存
     response: BlockResp
 }
 
 impl Future for BlockFuture<'_> {
     type Output = Result<()>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        unsafe { riscv::register::sie::clear_sext(); }
         match self.queue.can_pop() {
             true => {
-                // println!("[virtio] poll in BlockFuture, return ready");
+                println!("[virtio] poll in BlockFuture, return ready, status: {:?}", self.response.status);
                 self.queue.pop_used()?;
                 match self.response.status {
-                    BlockRespStatus::Ok => Poll::Ready(Ok(())),
-                    _ => Poll::Ready(Err(VirtIOError::IOError))
+                    BlockRespStatus::Ok => {
+                        unsafe { riscv::register::sie::set_sext(); }
+                        Poll::Ready(Ok(()))
+                    },
+                    _ => {
+                        unsafe { riscv::register::sie::set_sext(); }
+                        Poll::Ready(Err(VirtIOError::IOError))
+                    }
                 }
             }
             false => {
                 // 这里不进行唤醒，直接返回 pending
                 // 外部中断到来的时候在内核里面唤醒
-                // println!("[vitio] poll in BlockFuture, return pending");
+                println!("[vitio] poll in BlockFuture, return pending");
+                unsafe { riscv::register::sie::set_sext(); }
                 Poll::Pending
             }
         }
+        
     }
 }
 
@@ -50,17 +60,17 @@ unsafe impl Sync for BlockFuture<'_> {}
 
 /// 虚拟块设备
 /// 读写请求放在虚拟队列里面并会被设备处理
-pub struct VirtIOBlock<'blk> {
+pub struct VirtIOBlock {
     header: &'static mut VirtIOHeader,
     /// 虚拟队列
-    queue: VirtQueue<'blk>,
+    queue: VirtQueue,
     /// 容量
     capacity: usize
 }
 
-impl<'blk> VirtIOBlock<'blk> {
+impl VirtIOBlock {
     /// 以异步方式创建虚拟块设备驱动
-    pub async fn async_new(header: &'static mut VirtIOHeader) -> Result<VirtIOBlock<'blk>> {
+    pub async fn async_new(header: &'static mut VirtIOHeader) -> Result<VirtIOBlock> {
         if !header.verify() {
             return Err(VirtIOError::HeaderVerifyError);
         }
@@ -135,7 +145,7 @@ impl<'blk> VirtIOBlock<'blk> {
     }
 
     /// 以异步方式读取一个块
-    pub fn async_read(&'blk mut self, block_id: usize, buf: &mut [u8]) -> BlockFuture<'blk> {
+    pub fn async_read(&mut self, block_id: usize, buf: &mut [u8]) -> BlockFuture {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
@@ -157,7 +167,7 @@ impl<'blk> VirtIOBlock<'blk> {
     }
 
     /// 以异步方式写入一个块
-    pub fn async_write(&'blk mut self, block_id: usize, buf: &[u8]) -> BlockFuture {
+    pub fn async_write(&mut self, block_id: usize, buf: &[u8]) -> BlockFuture {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
@@ -179,10 +189,11 @@ impl<'blk> VirtIOBlock<'blk> {
     }
 
     /// 处理 virtio 外部中断
-    pub unsafe fn handle_interrupt(&self) -> Result<InterruptRet> {
+    pub unsafe fn handle_interrupt(&mut self) -> Result<InterruptRet> {
         if !self.queue.can_pop() {
             return Err(VirtIOError::IOError);
         }
+        self.ack_interrupt();
         let (index, _len) = self.queue.next_used()?;
         let desc = self.queue.descriptor(index as usize);
         let desc_va = virtio_phys_to_virt(desc.paddr.read() as usize);

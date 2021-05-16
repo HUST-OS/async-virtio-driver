@@ -17,15 +17,16 @@ type UsedRing = Ring<UsedElement>;
 
 /// Virtio 中的虚拟队列接口，前后端通信的桥梁
 #[repr(C)]
-pub struct VirtQueue<'virtio> {
+pub struct VirtQueue {
     /// DMA 空间
     dma: DMA,
-    /// 描述符表
-    descriptor_table: &'virtio mut [Descriptor],
-    /// 可用环
-    avail_ring: &'virtio mut AvailableRing,
-    /// 已用环
-    used_ring: &'virtio mut UsedRing,
+    // /// 描述符表
+    // descriptor_table: &'virtio mut [Descriptor],
+    // /// 可用环
+    // avail_ring: &'virtio mut AvailableRing,
+    // /// 已用环
+    // used_ring: &'virtio mut UsedRing,
+    queue_layout: VirtQueueMemLayout,
     /// 虚拟队列索引值
     /// 一个虚拟设备实现可能有多个虚拟队列
     queue_index: u32,
@@ -42,7 +43,7 @@ pub struct VirtQueue<'virtio> {
     last_used_index: u16
 }
 
-impl VirtQueue<'_> {
+impl VirtQueue {
     pub fn new(
         header: &mut VirtIOHeader, index: usize, size: u16
     ) -> Result<Self> {
@@ -65,14 +66,14 @@ impl VirtQueue<'_> {
         let desc_table = unsafe {
             core::slice::from_raw_parts_mut(dma.start_virtual_address() as *mut Descriptor, size as usize)
         };
-        // 可用环起始地址
-        let avail_ring = unsafe {
-            &mut *((dma.start_virtual_address() + queue_layout.avail_ring_offset) as *mut AvailableRing)
-        };
-        // 已用环起始地址
-        let used_ring = unsafe {
-            &mut *((dma.start_virtual_address() + queue_layout.used_ring_offset) as *mut UsedRing)
-        };
+        // // 可用环起始地址
+        // let avail_ring = unsafe {
+        //     &mut *((dma.start_virtual_address() + queue_layout.avail_ring_offset) as *mut AvailableRing)
+        // };
+        // // 已用环起始地址
+        // let used_ring = unsafe {
+        //     &mut *((dma.start_virtual_address() + queue_layout.used_ring_offset) as *mut UsedRing)
+        // };
 
         // 将空描述符连成链表
         for i in 0..(size - 1) {
@@ -81,9 +82,7 @@ impl VirtQueue<'_> {
 
         Ok(VirtQueue {
             dma,
-            descriptor_table: desc_table,
-            avail_ring,
-            used_ring,
+            queue_layout,
             queue_size: size,
             queue_index: index as u32,
             used_num: 0,
@@ -93,9 +92,27 @@ impl VirtQueue<'_> {
         })
     }
 
-    pub async fn async_new<'virtio>(
+    pub fn descriptor_table(&self) -> &mut [Descriptor] {
+        unsafe {
+            core::slice::from_raw_parts_mut(self.dma.start_virtual_address() as *mut Descriptor, self.queue_size as usize)
+        }
+    }
+
+    pub fn avail_ring(&self) -> &mut AvailableRing {
+        unsafe {
+            &mut *((self.dma.start_virtual_address() + self.queue_layout.avail_ring_offset) as *mut AvailableRing)
+        }
+    }
+
+    pub fn used_ring(&self) -> &mut UsedRing {
+        unsafe {
+            &mut *((self.dma.start_virtual_address() + self.queue_layout.used_ring_offset) as *mut UsedRing)
+        }
+    }
+    
+    pub async fn async_new(
         header: &mut VirtIOHeader, index: usize, size: u16
-    ) -> Result<VirtQueue<'virtio>> {
+    ) -> Result<VirtQueue> {
         if header.queue_used(index as u32) {
             return Err(VirtIOError::QueueInUsed(index));
         }
@@ -115,14 +132,14 @@ impl VirtQueue<'_> {
         let desc_table = unsafe {
             core::slice::from_raw_parts_mut(dma.start_virtual_address() as *mut Descriptor, size as usize)
         };
-        // 可用环起始地址
-        let avail_ring = unsafe {
-            &mut *((dma.start_virtual_address() + queue_layout.avail_ring_offset) as *mut AvailableRing)
-        };
-        // 已用环起始地址
-        let used_ring = unsafe {
-            &mut *((dma.start_virtual_address() + queue_layout.used_ring_offset) as *mut UsedRing)
-        };
+        // // 可用环起始地址
+        // let avail_ring = unsafe {
+        //     &mut *((dma.start_virtual_address() + queue_layout.avail_ring_offset) as *mut AvailableRing)
+        // };
+        // // 已用环起始地址
+        // let used_ring = unsafe {
+        //     &mut *((dma.start_virtual_address() + queue_layout.used_ring_offset) as *mut UsedRing)
+        // };
 
         // 将空描述符连成链表
         for i in 0..(size - 1) {
@@ -131,9 +148,7 @@ impl VirtQueue<'_> {
 
         Ok(VirtQueue {
             dma,
-            descriptor_table: desc_table,
-            avail_ring,
-            used_ring,
+            queue_layout,
             queue_size: size,
             queue_index: index as u32,
             used_num: 0,
@@ -157,7 +172,7 @@ impl VirtQueue<'_> {
         let head = self.free_desc_head;
         let mut tail = self.free_desc_head;
         inputs.iter().for_each(|input| {
-            let desc = &mut self.descriptor_table[self.free_desc_head as usize];
+            let desc = &mut self.descriptor_table()[self.free_desc_head as usize];
             // 将 buffer 的信息写入描述符
             desc.set_buf(input);
             // 设置描述符的标识位
@@ -166,7 +181,7 @@ impl VirtQueue<'_> {
             self.free_desc_head = desc.next.read();
         });
         outputs.iter().for_each(|output| {
-            let desc = &mut self.descriptor_table[self.free_desc_head as usize];
+            let desc = &mut self.descriptor_table()[self.free_desc_head as usize];
             desc.set_buf(output);
             desc.flags.write(DescriptorFlags::NEXT | DescriptorFlags::WRITE);
             tail = self.free_desc_head;
@@ -174,7 +189,7 @@ impl VirtQueue<'_> {
         });
         // 清除描述符链的最后一个元素的 next 指针
         {
-            let desc = &mut self.descriptor_table[tail as usize];
+            let desc = &mut self.descriptor_table()[tail as usize];
             let mut flags = desc.flags.read();
             flags.remove(DescriptorFlags::NEXT);
             desc.flags.write(flags);
@@ -184,20 +199,20 @@ impl VirtQueue<'_> {
 
         // 将描述符链的头部放入可用环中
         let avail_slot = self.avail_index & (self.queue_size - 1);
-        self.avail_ring.ring[avail_slot as usize].write(head);
+        self.avail_ring().ring[avail_slot as usize].write(head);
         
         // write barrier(内存屏障操作？)
         fence(Ordering::SeqCst);
 
         // 更新可用环的头部
         self.avail_index = self.avail_index.wrapping_add(1);
-        self.avail_ring.idx.write(self.avail_index);
+        self.avail_ring().idx.write(self.avail_index);
         Ok(head)
     }
 
     /// 是否可以从可用环中弹出没处理的项
     pub fn can_pop(&self) -> bool {
-        self.last_used_index != self.used_ring.idx.read()
+        self.last_used_index != self.used_ring().idx.read()
     }
 
     /// 可用的空闲描述符数量
@@ -211,13 +226,14 @@ impl VirtQueue<'_> {
         let origin_desc_head = self.free_desc_head;
         self.free_desc_head = head;
         loop {
-            let desc = &mut self.descriptor_table[head as usize];
+            let desc = &mut self.descriptor_table()[head as usize];
             let flags = desc.flags.read();
-            self.used_num -= 1;
             if flags.contains(DescriptorFlags::NEXT) {
                 head = desc.next.read();
+                self.used_num -= 1;
             } else {
                 desc.next.write(origin_desc_head);
+                self.used_num -= 1;
                 return;
             }
         }
@@ -233,8 +249,8 @@ impl VirtQueue<'_> {
         fence(Ordering::SeqCst);
 
         let last_used_slot = self.last_used_index &  (self.queue_size - 1);
-        let index = self.used_ring.ring[last_used_slot as usize].id.read() as u16;
-        let len = self.used_ring.ring[last_used_slot as usize].len.read();
+        let index = self.used_ring().ring[last_used_slot as usize].id.read() as u16;
+        let len = self.used_ring().ring[last_used_slot as usize].len.read();
 
         self.recycle_descriptors(index);
         self.last_used_index = self.last_used_index.wrapping_add(1);
@@ -252,14 +268,14 @@ impl VirtQueue<'_> {
         fence(Ordering::SeqCst);
 
         let last_used_slot = self.last_used_index &  (self.queue_size - 1);
-        let index = self.used_ring.ring[last_used_slot as usize].id.read() as u16;
-        let len = self.used_ring.ring[last_used_slot as usize].len.read();
+        let index = self.used_ring().ring[last_used_slot as usize].id.read() as u16;
+        let len = self.used_ring().ring[last_used_slot as usize].len.read();
 
         Ok((index, len))
     }
 
     pub fn descriptor(&self, index: usize) -> Descriptor {
-        self.descriptor_table[index].clone()
+        self.descriptor_table()[index].clone()
     }
 }
 
@@ -341,11 +357,11 @@ bitflags! {
 /// 通过泛型对可用环和已用环进行统一抽象
 #[repr(C)]
 #[derive(Debug)]
-struct Ring<Entry: Sized> {
+pub struct Ring<Entry: Sized> {
     /// 与通知机制相关
     flags: Volatile<u16>,
     idx: Volatile<u16>,
-    ring:  [Entry; VIRT_QUEUE_SIZE],
+    pub ring:  [Entry; VIRT_QUEUE_SIZE],
     // unused
     event: Volatile<u16>
 }
@@ -353,7 +369,7 @@ struct Ring<Entry: Sized> {
 /// 已用环中的项
 #[repr(C)]
 #[derive(Debug)]
-struct UsedElement {
+pub struct UsedElement {
     id: Volatile<u32>,
     len: Volatile<u32>
 }
