@@ -23,6 +23,8 @@ extern "C" {
     fn virtio_dma_alloc(pages: usize) -> PhysicalAddress;
     /// 回收一定页数的内存
     fn virtio_dma_dealloc(paddr: PhysicalAddress, pages: usize) -> i32;
+    /// 内核提供的物理地址到虚拟地址的转换函数
+    fn virtio_phys_to_virt(paddr: PhysicalAddress) -> VirtualAddress;
 }
 
 pub struct DMAAllocFuture {
@@ -65,7 +67,7 @@ impl DMA {
             pages,
         })
     }
-
+    
     /// 向操作系统内核申请分配 DMA 空间
     pub fn alloc(pages: usize) -> DMAAllocFuture {
         DMAAllocFuture {
