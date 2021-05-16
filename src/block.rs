@@ -51,7 +51,7 @@ unsafe impl Sync for BlockFuture<'_> {}
 /// 虚拟块设备
 /// 读写请求放在虚拟队列里面并会被设备处理
 pub struct VirtIOBlock<'blk> {
-    header: &'blk mut VirtIOHeader,
+    header: &'static mut VirtIOHeader,
     /// 虚拟队列
     queue: VirtQueue<'blk>,
     /// 容量
@@ -60,7 +60,7 @@ pub struct VirtIOBlock<'blk> {
 
 impl<'blk> VirtIOBlock<'blk> {
     /// 以异步方式创建虚拟块设备驱动
-    pub async fn async_new(header: &'blk mut VirtIOHeader) -> Result<VirtIOBlock<'blk>> {
+    pub async fn async_new(header: &'static mut VirtIOHeader) -> Result<VirtIOBlock<'blk>> {
         if !header.verify() {
             return Err(VirtIOError::HeaderVerifyError);
         }
@@ -95,7 +95,7 @@ impl<'blk> VirtIOBlock<'blk> {
         })
     }
 
-    pub fn new(header: &'blk mut VirtIOHeader) -> Result<Self> {
+    pub fn new(header: &'static mut VirtIOHeader) -> Result<Self> {
         if !header.verify() {
             return Err(VirtIOError::HeaderVerifyError);
         }
@@ -135,7 +135,7 @@ impl<'blk> VirtIOBlock<'blk> {
     }
 
     /// 以异步方式读取一个块
-    pub fn async_read(&'blk mut self, block_id: usize, buf: &'blk mut [u8]) -> BlockFuture<'blk> {
+    pub fn async_read(&'blk mut self, block_id: usize, buf: &mut [u8]) -> BlockFuture<'blk> {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
@@ -157,7 +157,7 @@ impl<'blk> VirtIOBlock<'blk> {
     }
 
     /// 以异步方式写入一个块
-    pub fn async_write(&'blk mut self, block_id: usize, buf: &'blk [u8]) -> BlockFuture {
+    pub fn async_write(&'blk mut self, block_id: usize, buf: &[u8]) -> BlockFuture {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
