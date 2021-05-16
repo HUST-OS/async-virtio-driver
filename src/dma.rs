@@ -102,6 +102,7 @@ impl DMA {
     }
 }
 
+/// DMA 在生命周期结束的时候需要在内核里面回收相应的内存空间
 impl Drop for DMA {
     fn drop(&mut self) {
         let err = unsafe {
