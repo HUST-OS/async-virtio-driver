@@ -93,6 +93,56 @@ impl VirtQueue<'_> {
         })
     }
 
+    pub async fn async_new<'virtio>(
+        header: &mut VirtIOHeader, index: usize, size: u16
+    ) -> Result<VirtQueue<'virtio>> {
+        if header.queue_used(index as u32) {
+            return Err(VirtIOError::QueueInUsed(index));
+        }
+        if !size.is_power_of_two() || header.max_queue_size() < size as u32 {
+            return Err(VirtIOError::InvalidParameter);
+        }
+        let queue_layout = VirtQueueMemLayout::new(size);
+        let dma = DMA::alloc(queue_layout.mem_size / PAGE_SIZE).await;
+        println!("[virtio] DMA address: {:#x}", dma.start_physical_address());
+
+        // 在 MMIO 接口中设置虚拟队列的相关信息
+        header.queue_set(
+            index as u32, size as u32, PAGE_SIZE as u32, dma.ppn() as u32
+        );
+
+        // 描述符表起始地址
+        let desc_table = unsafe {
+            core::slice::from_raw_parts_mut(dma.start_virtual_address() as *mut Descriptor, size as usize)
+        };
+        // 可用环起始地址
+        let avail_ring = unsafe {
+            &mut *((dma.start_virtual_address() + queue_layout.avail_ring_offset) as *mut AvailableRing)
+        };
+        // 已用环起始地址
+        let used_ring = unsafe {
+            &mut *((dma.start_virtual_address() + queue_layout.used_ring_offset) as *mut UsedRing)
+        };
+
+        // 将空描述符连成链表
+        for i in 0..(size - 1) {
+            desc_table[i as usize].next.write(i + 1);
+        }
+
+        Ok(VirtQueue {
+            dma,
+            descriptor_table: desc_table,
+            avail_ring,
+            used_ring,
+            queue_size: size,
+            queue_index: index as u32,
+            used_num: 0,
+            free_desc_head: 0,
+            avail_index: 0,
+            last_used_index: 0
+        })
+    }
+
     /// 添加 buffers 到虚拟队列，返回一个 token
     pub fn add_buf(&mut self, inputs: &[&[u8]], outputs: &[&mut [u8]]) -> Result<u16> {
         if inputs.is_empty() && outputs.is_empty() {
@@ -173,7 +223,7 @@ impl VirtQueue<'_> {
         }
     }
 
-    /// 从已用环中获取一个 token，并返回长度
+    /// 从已用环中弹出一个 token，并返回长度
     /// ref: linux virtio_ring.c virtqueue_get_buf_ctx
     pub fn pop_used(&mut self) -> Result<(u16, u32)> {
         if !self.can_pop() {
@@ -190,6 +240,26 @@ impl VirtQueue<'_> {
         self.last_used_index = self.last_used_index.wrapping_add(1);
 
         Ok((index, len))
+    }
+
+    /// 从已用环中取出下一个 token，但不弹出
+    pub fn next_used(&self) -> Result<(u16, u32)> {
+        if !self.can_pop() {
+            return Err(VirtIOError::UsedRingNotReady);
+        }
+
+        // read barrier
+        fence(Ordering::SeqCst);
+
+        let last_used_slot = self.last_used_index &  (self.queue_size - 1);
+        let index = self.used_ring.ring[last_used_slot as usize].id.read() as u16;
+        let len = self.used_ring.ring[last_used_slot as usize].len.read();
+
+        Ok((index, len))
+    }
+
+    pub fn descriptor(&self, index: usize) -> Descriptor {
+        self.descriptor_table[index].clone()
     }
 }
 

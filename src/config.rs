@@ -6,3 +6,6 @@ pub const MAX_DMA_ALLOC_COUNT: u32 = 0x10;
 
 /// 虚拟队列大小
 pub const VIRT_QUEUE_SIZE: usize = 32;
+
+/// 块大小
+pub const BLOCK_SIZE: usize = 512;
