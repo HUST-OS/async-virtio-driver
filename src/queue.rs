@@ -143,6 +143,25 @@ impl VirtQueue<'_> {
         })
     }
 
+    pub fn print_desc_table(&self) {
+        self.descriptor_table.iter().for_each(|x| {
+            println!("{:#x?}", x);
+        });
+    }
+    pub fn print_avail_ring(&self) {
+        self.avail_ring.ring.iter().for_each(|x| {
+            print!("{} ", x.read());
+        });
+        println!("");
+    }
+
+    pub fn print_used_ring(&self) {
+        self.used_ring.ring.iter().for_each(|x| {
+            print!("{:#x?} ", x);
+        });
+        println!("");
+    }
+
     /// 添加 buffers 到虚拟队列，返回一个 token
     pub fn add_buf(&mut self, inputs: &[&[u8]], outputs: &[&mut [u8]]) -> Result<u16> {
         if inputs.is_empty() && outputs.is_empty() {
@@ -349,6 +368,28 @@ struct Ring<Entry: Sized> {
     // unused
     event: Volatile<u16>
 }
+
+// #[repr(C)]
+// #[derive(Debug)]
+// struct UsedRing {
+//     /// 与通知机制相关
+//     flags: Volatile<u16>,
+//     idx: Volatile<u16>,
+//     ring:  [UsedElement; VIRT_QUEUE_SIZE],
+//     // unused
+//     event: Volatile<u16>
+// }
+
+// #[repr(C)]
+// #[derive(Debug)]
+// struct AvailableRing {
+//     /// 与通知机制相关
+//     flags: Volatile<u16>,
+//     idx: Volatile<u16>,
+//     ring:  [Volatile<u16>; VIRT_QUEUE_SIZE],
+//     // unused
+//     event: Volatile<u16>
+// }
 
 /// 已用环中的项
 #[repr(C)]

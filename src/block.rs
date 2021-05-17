@@ -4,7 +4,7 @@
 
 use bitflags::bitflags;
 use volatile::Volatile;
-use core::future::Future;
+use core::{future::Future, hint::spin_loop};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use super::mmio::VirtIOHeader;
@@ -28,8 +28,10 @@ impl Future for BlockFuture<'_> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.queue.can_pop() {
             true => {
-                // println!("[virtio] poll in BlockFuture, return ready");
+                println!("[virtio] poll in BlockFuture, return ready, resp status: {:?}", self.response.status);
                 self.queue.pop_used()?;
+                // while self.response.status != BlockRespStatus::Ok {}
+                // Poll::Ready(Ok(()))
                 match self.response.status {
                     BlockRespStatus::Ok => Poll::Ready(Ok(())),
                     _ => Poll::Ready(Err(VirtIOError::IOError))
@@ -38,7 +40,7 @@ impl Future for BlockFuture<'_> {
             false => {
                 // 这里不进行唤醒，直接返回 pending
                 // 外部中断到来的时候在内核里面唤醒
-                // println!("[vitio] poll in BlockFuture, return pending");
+                println!("[vitio] poll in BlockFuture, return pending");
                 Poll::Pending
             }
         }
@@ -135,7 +137,7 @@ impl<'blk> VirtIOBlock<'blk> {
     }
 
     /// 以异步方式读取一个块
-    pub fn async_read(&'blk mut self, block_id: usize, buf: &'blk mut [u8]) -> BlockFuture<'blk> {
+    pub fn async_read(&'blk mut self, block_id: usize, buf: &mut [u8]) -> BlockFuture<'blk> {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
@@ -157,7 +159,7 @@ impl<'blk> VirtIOBlock<'blk> {
     }
 
     /// 以异步方式写入一个块
-    pub fn async_write(&'blk mut self, block_id: usize, buf: &'blk [u8]) -> BlockFuture {
+    pub fn async_write(&'blk mut self, block_id: usize, buf: &[u8]) -> BlockFuture {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
@@ -175,6 +177,48 @@ impl<'blk> VirtIOBlock<'blk> {
             _req_type: 1,
             queue: &mut self.queue,
             response: resp
+        }
+    }
+
+    pub fn read_block(&'blk mut self, block_id: usize, buf: &mut [u8]) -> Result<()> {
+        assert_eq!(buf.len(), BLOCK_SIZE);
+        let req = BlockReq {
+            type_: BlockReqType::In,
+            reserved: 0,
+            sector: block_id as u64,
+        };
+        let mut resp = BlockResp::default();
+        self.queue.add_buf(&[req.as_buf()], &[buf, resp.as_buf_mut()])
+            .expect("[virtio] virtual queue add buf error");
+        self.header.notify(0);
+        while !self.queue.can_pop() {
+            spin_loop();
+        }
+        self.queue.pop_used()?;
+        match resp.status {
+            BlockRespStatus::Ok => Ok(()),
+            _ => Err(VirtIOError::IOError)
+        }
+    }
+
+    pub fn write_block(&'blk mut self, block_id: usize, buf: &[u8]) -> Result<()> {
+        assert_eq!(buf.len(), BLOCK_SIZE);
+        let req = BlockReq {
+            type_: BlockReqType::Out,
+            reserved: 0,
+            sector: block_id as u64,
+        };
+        let mut resp = BlockResp::default();
+        self.queue.add_buf(&[req.as_buf(), buf], &[resp.as_buf_mut()])
+            .expect("[virtio] virtual queue add buf error");
+        self.header.notify(0);
+        while !self.queue.can_pop() {
+            spin_loop();
+        }
+        self.queue.pop_used()?;
+        match resp.status {
+            BlockRespStatus::Ok => Ok(()),
+            _ => Err(VirtIOError::IOError)
         }
     }
 
