@@ -66,14 +66,6 @@ impl VirtQueue {
         let desc_table = unsafe {
             core::slice::from_raw_parts_mut(dma.start_virtual_address() as *mut Descriptor, size as usize)
         };
-        // // 可用环起始地址
-        // let avail_ring = unsafe {
-        //     &mut *((dma.start_virtual_address() + queue_layout.avail_ring_offset) as *mut AvailableRing)
-        // };
-        // // 已用环起始地址
-        // let used_ring = unsafe {
-        //     &mut *((dma.start_virtual_address() + queue_layout.used_ring_offset) as *mut UsedRing)
-        // };
 
         // 将空描述符连成链表
         for i in 0..(size - 1) {
@@ -132,14 +124,6 @@ impl VirtQueue {
         let desc_table = unsafe {
             core::slice::from_raw_parts_mut(dma.start_virtual_address() as *mut Descriptor, size as usize)
         };
-        // // 可用环起始地址
-        // let avail_ring = unsafe {
-        //     &mut *((dma.start_virtual_address() + queue_layout.avail_ring_offset) as *mut AvailableRing)
-        // };
-        // // 已用环起始地址
-        // let used_ring = unsafe {
-        //     &mut *((dma.start_virtual_address() + queue_layout.used_ring_offset) as *mut UsedRing)
-        // };
 
         // 将空描述符连成链表
         for i in 0..(size - 1) {
