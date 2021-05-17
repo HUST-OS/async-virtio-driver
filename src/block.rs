@@ -7,6 +7,7 @@ use volatile::Volatile;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use core::ptr::NonNull;
 use super::mmio::VirtIOHeader;
 use super::queue::VirtQueue;
 use super::util::AsBuf;
@@ -20,33 +21,26 @@ pub struct BlockFuture<'blk> {
     /// 该块设备的虚拟队列，用于 poll 操作的时候判断请求是否完成
     queue: &'blk mut VirtQueue,
     /// 块设备的回应，用于 poll 操作的时候从这里读取请求被处理的状态
-    // todo: 这里可能需要用 spin 定住内存
-    response: BlockResp
+    /// unused
+    response: NonNull<()>,
 }
 
 impl Future for BlockFuture<'_> {
     type Output = Result<()>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         unsafe { riscv::register::sie::clear_sext(); }
+        // 这里对 status 的判断有很奇怪的 bug，先不对其进行判断
+        let resp: NonNull<BlockResp> = self.response.cast();
+        let status = unsafe { *&resp.as_ref().status };
         match self.queue.can_pop() {
             true => {
-                println!("[virtio] poll in BlockFuture, return ready, status: {:?}", self.response.status);
                 self.queue.pop_used()?;
-                match self.response.status {
-                    BlockRespStatus::Ok => {
-                        unsafe { riscv::register::sie::set_sext(); }
-                        Poll::Ready(Ok(()))
-                    },
-                    _ => {
-                        unsafe { riscv::register::sie::set_sext(); }
-                        Poll::Ready(Err(VirtIOError::IOError))
-                    }
-                }
+                unsafe { riscv::register::sie::set_sext(); }
+                Poll::Ready(Ok(()))
             }
             false => {
                 // 这里不进行唤醒，直接返回 pending
                 // 外部中断到来的时候在内核里面唤醒
-                println!("[vitio] poll in BlockFuture, return pending");
                 unsafe { riscv::register::sie::set_sext(); }
                 Poll::Pending
             }
@@ -157,12 +151,13 @@ impl VirtIOBlock {
         let mut resp = BlockResp::default();
         self.queue.add_buf(&[req.as_buf()], &[buf, resp.as_buf_mut()])
             .expect("[virtio] virtual queue add buf error");
-        
+    
         self.header.notify(0);
+
         BlockFuture {
             _req_type: 0,
             queue: &mut self.queue,
-            response: resp
+            response: NonNull::new(&resp as *const _ as *mut ()).unwrap()
         }
     }
 
@@ -179,12 +174,56 @@ impl VirtIOBlock {
         let mut resp = BlockResp::default();
         self.queue.add_buf(&[req.as_buf(), buf], &[resp.as_buf_mut()])
             .expect("[virtio] virtual queue add buf error");
-        
+
         self.header.notify(0);
         BlockFuture {
             _req_type: 1,
             queue: &mut self.queue,
-            response: resp
+            response: NonNull::new(&resp as *const _ as *mut ()).unwrap()
+        }
+    }
+
+    pub fn read_block(&mut self, block_id: usize, buf: &mut [u8]) -> Result<()> {
+        if buf.len() != BLOCK_SIZE {
+            panic!("[virtio] buffer size must equal to block size - 512!");
+        }
+        let req = BlockReq {
+            type_: BlockReqType::In,
+            reserved: 0,
+            sector: block_id as u64,
+        };
+        let mut resp = BlockResp::default();
+        self.queue.add_buf(&[req.as_buf()], &[buf, resp.as_buf_mut()])
+            .expect("[virtio] virtual queue add buf error");
+        
+        self.header.notify(0);
+        while !self.queue.can_pop() {}
+        self.queue.pop_used()?;
+        match resp.status {
+            BlockRespStatus::Ok => Ok(()),
+            _ => Err(VirtIOError::IOError)
+        }
+    }
+
+    pub fn write_block(&mut self, block_id: usize, buf: &[u8]) -> Result<()> {
+        if buf.len() != BLOCK_SIZE {
+            panic!("[virtio] buffer size must equal to block size - 512!");
+        }
+        let req = BlockReq {
+            type_: BlockReqType::Out,
+            reserved: 0,
+            sector: block_id as u64,
+        };
+        let mut resp = BlockResp::default();
+        self.queue.add_buf(&[req.as_buf(), buf], &[resp.as_buf_mut()])
+            .expect("[virtio] virtual queue add buf error");
+        
+        self.header.notify(0);
+        while !self.queue.can_pop() {}
+        self.queue.pop_used()?;
+        match resp.status {
+            BlockRespStatus::Ok => Ok(()),
+            _ => Err(VirtIOError::IOError)
         }
     }
 
@@ -305,18 +344,18 @@ enum BlockReqType {
 
 /// 块设备回应状态
 #[repr(u8)]
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
 enum BlockRespStatus {
     Ok = 0,
     IoErr = 1,
     Unsupported = 2,
-    _NotReady = 3,
+    NotReady = 3,
 }
 
 impl Default for BlockResp {
     fn default() -> Self {
         BlockResp {
-            status: BlockRespStatus::_NotReady,
+            status: BlockRespStatus::NotReady,
         }
     }
 }

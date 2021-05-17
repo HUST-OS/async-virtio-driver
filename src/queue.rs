@@ -277,6 +277,12 @@ impl VirtQueue {
     pub fn descriptor(&self, index: usize) -> Descriptor {
         self.descriptor_table()[index].clone()
     }
+
+    pub fn print_desc_table(&self) {
+        self.descriptor_table().iter().for_each(|desc| {
+            println!("{:#x?}", desc);
+        });
+    }
 }
 
 /// 虚拟队列内存布局信息

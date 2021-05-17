@@ -11,6 +11,8 @@ pub mod queue;
 pub mod mmio;
 pub mod block;
 
+extern crate alloc;
+
 pub type Result<T = ()> = core::result::Result<T, VirtIOError>;
 
 // pub use mmio::*;
