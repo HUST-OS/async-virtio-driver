@@ -5,8 +5,8 @@
 use volatile::Volatile;
 use bitflags::bitflags;
 use core::{mem::size_of, sync::atomic::{fence, Ordering}};
+use core::ptr::NonNull;
 use crate::util::align_up_page;
-
 use super::dma::DMA;
 use super::mmio::VirtIOHeader;
 use super::config::*;
@@ -16,17 +16,21 @@ type AvailableRing = Ring<Volatile<u16>>;
 type UsedRing = Ring<UsedElement>;
 
 /// Virtio 中的虚拟队列接口，前后端通信的桥梁
+///
+/// unsafe:
+/// 这里用了 NonNull，不确定在多个硬件线程的情况下是否安全
+/// 为了通过编译，手动实现了 Send 和 Sync Trait
+/// todo: 检查这里的安全性
 #[repr(C)]
 pub struct VirtQueue {
     /// DMA 空间
     dma: DMA,
-    // /// 描述符表
-    // descriptor_table: &'virtio mut [Descriptor],
-    // /// 可用环
-    // avail_ring: &'virtio mut AvailableRing,
-    // /// 已用环
-    // used_ring: &'virtio mut UsedRing,
-    queue_layout: VirtQueueMemLayout,
+    /// 描述符表
+    descriptor_table: NonNull<[Descriptor]>,
+    /// 可用环
+    avail_ring: NonNull<AvailableRing>,
+    /// 已用环
+    used_ring: NonNull<UsedRing>,
     /// 虚拟队列索引值
     /// 一个虚拟设备实现可能有多个虚拟队列
     queue_index: u32,
@@ -72,9 +76,19 @@ impl VirtQueue {
             desc_table[i as usize].next.write(i + 1);
         }
 
+        let descriptor_table = NonNull::new(desc_table).unwrap();
+        let avail_ring = NonNull::new(
+            unsafe { &mut *((dma.start_virtual_address() + queue_layout.avail_ring_offset) as *mut AvailableRing) }
+        ).unwrap();
+        let used_ring = NonNull::new(
+            unsafe { &mut *((dma.start_virtual_address() + queue_layout.used_ring_offset) as *mut UsedRing) }
+        ).unwrap();
+
         Ok(VirtQueue {
             dma,
-            queue_layout,
+            descriptor_table,
+            avail_ring,
+            used_ring,
             queue_size: size,
             queue_index: index as u32,
             used_num: 0,
@@ -82,24 +96,6 @@ impl VirtQueue {
             avail_index: 0,
             last_used_index: 0
         })
-    }
-
-    pub fn descriptor_table(&self) -> &mut [Descriptor] {
-        unsafe {
-            core::slice::from_raw_parts_mut(self.dma.start_virtual_address() as *mut Descriptor, self.queue_size as usize)
-        }
-    }
-
-    pub fn avail_ring(&self) -> &mut AvailableRing {
-        unsafe {
-            &mut *((self.dma.start_virtual_address() + self.queue_layout.avail_ring_offset) as *mut AvailableRing)
-        }
-    }
-
-    pub fn used_ring(&self) -> &mut UsedRing {
-        unsafe {
-            &mut *((self.dma.start_virtual_address() + self.queue_layout.used_ring_offset) as *mut UsedRing)
-        }
     }
     
     pub async fn async_new(
@@ -130,9 +126,19 @@ impl VirtQueue {
             desc_table[i as usize].next.write(i + 1);
         }
 
+        let descriptor_table = NonNull::new(desc_table).unwrap();
+        let avail_ring = NonNull::new(
+            unsafe { &mut *((dma.start_virtual_address() + queue_layout.avail_ring_offset) as *mut AvailableRing) }
+        ).unwrap();
+        let used_ring = NonNull::new(
+            unsafe { &mut *((dma.start_virtual_address() + queue_layout.used_ring_offset) as *mut UsedRing) }
+        ).unwrap();
+
         Ok(VirtQueue {
             dma,
-            queue_layout,
+            descriptor_table,
+            avail_ring,
+            used_ring,
             queue_size: size,
             queue_index: index as u32,
             used_num: 0,
@@ -155,25 +161,29 @@ impl VirtQueue {
         // 从空闲描述符表中分配描述符
         let head = self.free_desc_head;
         let mut tail = self.free_desc_head;
+        let mut self_free_desc_head = self.free_desc_head;
+        let descriptor_table = unsafe { self.descriptor_table.as_mut() };
         inputs.iter().for_each(|input| {
-            let desc = &mut self.descriptor_table()[self.free_desc_head as usize];
+            let desc = &mut descriptor_table[self_free_desc_head as usize];
             // 将 buffer 的信息写入描述符
             desc.set_buf(input);
             // 设置描述符的标识位
             desc.flags.write(DescriptorFlags::NEXT);
-            tail = self.free_desc_head;
-            self.free_desc_head = desc.next.read();
+            tail = self_free_desc_head;
+            self_free_desc_head = desc.next.read();
         });
+        self.free_desc_head = self_free_desc_head;
         outputs.iter().for_each(|output| {
-            let desc = &mut self.descriptor_table()[self.free_desc_head as usize];
+            let desc = &mut descriptor_table[self_free_desc_head as usize];
             desc.set_buf(output);
             desc.flags.write(DescriptorFlags::NEXT | DescriptorFlags::WRITE);
-            tail = self.free_desc_head;
-            self.free_desc_head = desc.next.read();
+            tail = self_free_desc_head;
+            self_free_desc_head = desc.next.read();
         });
+        self.free_desc_head = self_free_desc_head;
         // 清除描述符链的最后一个元素的 next 指针
         {
-            let desc = &mut self.descriptor_table()[tail as usize];
+            let desc = &mut descriptor_table[tail as usize];
             let mut flags = desc.flags.read();
             flags.remove(DescriptorFlags::NEXT);
             desc.flags.write(flags);
@@ -182,21 +192,23 @@ impl VirtQueue {
         self.used_num += (inputs.len() + outputs.len()) as u16;
 
         // 将描述符链的头部放入可用环中
+        let avail_ring = unsafe { self.avail_ring.as_mut() };
         let avail_slot = self.avail_index & (self.queue_size - 1);
-        self.avail_ring().ring[avail_slot as usize].write(head);
+        avail_ring.ring[avail_slot as usize].write(head);
         
         // write barrier(内存屏障操作？)
         fence(Ordering::SeqCst);
 
         // 更新可用环的头部
         self.avail_index = self.avail_index.wrapping_add(1);
-        self.avail_ring().idx.write(self.avail_index);
+        avail_ring.idx.write(self.avail_index);
         Ok(head)
     }
 
     /// 是否可以从可用环中弹出没处理的项
     pub fn can_pop(&self) -> bool {
-        self.last_used_index != self.used_ring().idx.read()
+        let used_ring = unsafe { self.used_ring.as_ref()  };
+        self.last_used_index != used_ring.idx.read()
     }
 
     /// 可用的空闲描述符数量
@@ -209,8 +221,9 @@ impl VirtQueue {
     fn recycle_descriptors(&mut self, mut head: u16) {
         let origin_desc_head = self.free_desc_head;
         self.free_desc_head = head;
+        let descriptor_table = unsafe { self.descriptor_table.as_mut() };
         loop {
-            let desc = &mut self.descriptor_table()[head as usize];
+            let desc = &mut descriptor_table[head as usize];
             let flags = desc.flags.read();
             if flags.contains(DescriptorFlags::NEXT) {
                 head = desc.next.read();
@@ -232,9 +245,10 @@ impl VirtQueue {
         // read barrier
         fence(Ordering::SeqCst);
 
+        let used_ring = unsafe { self.used_ring.as_mut() };
         let last_used_slot = self.last_used_index &  (self.queue_size - 1);
-        let index = self.used_ring().ring[last_used_slot as usize].id.read() as u16;
-        let len = self.used_ring().ring[last_used_slot as usize].len.read();
+        let index = used_ring.ring[last_used_slot as usize].id.read() as u16;
+        let len = used_ring.ring[last_used_slot as usize].len.read();
 
         self.recycle_descriptors(index);
         self.last_used_index = self.last_used_index.wrapping_add(1);
@@ -250,24 +264,31 @@ impl VirtQueue {
 
         // read barrier
         fence(Ordering::SeqCst);
-
+        
+        let used_ring = unsafe { self.used_ring.as_ref() };
         let last_used_slot = self.last_used_index &  (self.queue_size - 1);
-        let index = self.used_ring().ring[last_used_slot as usize].id.read() as u16;
-        let len = self.used_ring().ring[last_used_slot as usize].len.read();
+        let index = used_ring.ring[last_used_slot as usize].id.read() as u16;
+        let len = used_ring.ring[last_used_slot as usize].len.read();
 
         Ok((index, len))
     }
 
     pub fn descriptor(&self, index: usize) -> Descriptor {
-        self.descriptor_table()[index].clone()
+        unsafe { self.descriptor_table.as_ref()[index].clone() }
     }
 
     pub fn print_desc_table(&self) {
-        self.descriptor_table().iter().for_each(|desc| {
-            println!("{:#x?}", desc);
-        });
+        unsafe {
+            self.descriptor_table.as_ref().iter().for_each(|desc| {
+                println!("{:#x?}", desc);
+            });
+        }
     }
 }
+
+/// todo: unsafe
+unsafe impl Send for VirtQueue {}
+unsafe impl Sync for VirtQueue {}
 
 /// 虚拟队列内存布局信息
 struct VirtQueueMemLayout {
