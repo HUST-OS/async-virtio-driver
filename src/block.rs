@@ -28,20 +28,17 @@ pub struct BlockFuture<'blk> {
 impl Future for BlockFuture<'_> {
     type Output = Result<()>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        unsafe { riscv::register::sie::clear_sext(); }
         // 这里对 status 的判断有很奇怪的 bug，先不对其进行判断
         let resp: NonNull<BlockResp> = self.response.cast();
         let status = unsafe { *&resp.as_ref().status };
         match self.queue.can_pop() {
             true => {
                 self.queue.pop_used()?;
-                unsafe { riscv::register::sie::set_sext(); }
                 Poll::Ready(Ok(()))
             }
             false => {
                 // 这里不进行唤醒，直接返回 pending
                 // 外部中断到来的时候在内核里面唤醒
-                unsafe { riscv::register::sie::set_sext(); }
                 Poll::Pending
             }
         }
@@ -49,6 +46,7 @@ impl Future for BlockFuture<'_> {
     }
 }
 
+// todo: 检查这里的安全性
 unsafe impl Send for BlockFuture<'_> {}
 unsafe impl Sync for BlockFuture<'_> {}
 
