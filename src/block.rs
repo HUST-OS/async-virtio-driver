@@ -292,7 +292,6 @@ impl VirtIOBlock {
         if !q.can_pop() {
             return Err(VirtIOError::IOError);
         }
-        h.ack_interrupt();
         let (index, _len) = q.next_used()?;
         let desc = q.descriptor(index as usize);
         let desc_va = virtio_phys_to_virt(desc.paddr.read() as usize);
@@ -302,7 +301,12 @@ impl VirtIOBlock {
             BlockReqType::Out => InterruptRet::Write(req.sector as usize),
             _ => InterruptRet::Other
         };
-        Ok(ret)
+        // 通知设备外部中断已处理
+        if h.ack_interrupt() {
+            return Ok(ret)
+        } else {
+            return Err(VirtIOError::AckInterruptError)
+        }
     }
 }
 

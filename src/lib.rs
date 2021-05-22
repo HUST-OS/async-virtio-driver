@@ -37,4 +37,6 @@ pub enum VirtIOError {
     /// 出现在虚拟设备返回一个状态不是 Ok 的回应
     /// 和数据没准备好却进入了外部中断处理方法
     IOError,
+    /// 回应设备外部中断错误
+    AckInterruptError
 }
