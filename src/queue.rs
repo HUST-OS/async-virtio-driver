@@ -17,10 +17,6 @@ type UsedRing = Ring<UsedElement>;
 
 /// Virtio 中的虚拟队列接口，前后端通信的桥梁
 ///
-/// unsafe:
-/// 这里用了 NonNull，不确定在多个硬件线程的情况下是否安全
-/// 为了通过编译，手动实现了 Send 和 Sync Trait
-/// todo: 检查这里的安全性
 #[repr(C)]
 pub struct VirtQueue {
     /// DMA 空间
@@ -46,6 +42,11 @@ pub struct VirtQueue {
     /// 设备上次已取的已用环元素的位置
     last_used_index: u16
 }
+
+// 跨上下文递交所有权，结构体意义不变，可以 Send
+unsafe impl Send for VirtQueue {}
+// 可以跨上下文递交引用，也可以 Sync
+unsafe impl Sync for VirtQueue {}
 
 impl VirtQueue {
     pub fn new(
@@ -285,10 +286,6 @@ impl VirtQueue {
         }
     }
 }
-
-/// todo: unsafe
-unsafe impl Send for VirtQueue {}
-unsafe impl Sync for VirtQueue {}
 
 /// 虚拟队列内存布局信息
 struct VirtQueueMemLayout {
