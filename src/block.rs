@@ -1,6 +1,21 @@
 /// 虚拟块设备前端驱动
 /// ref: https://github.com/rcore-os/virtio-drivers/blob/master/src/blk.rs
 /// thanks!
+/// 
+/// BlockFuture 的 Send 和 Sync：
+/// + inner 成员是 Send 和 Sync 的，_req_type 和 response 成员暂时不会用到，因此从成员变量看来是 Send 和 Sync 的
+/// + poll 方法借助了 Mutex 实现内部可变性，在并发场景下多个 poll 操作一起运行的时候，有锁机制保证操作的原子性，因此是 Sync 的
+/// 因此个人觉得 BLockFuture 是 Send 和 Sync 的
+/// 
+/// VirtioBlock 设计需求分析：
+/// + 需要在并发场景下执行 async_read 或 async_write 或 ack_interrupt 操作，
+/// 因此这三个方法都必须是 &self 而不能是 &mut self，因此通过 Mutex 提供内部可变性，并保证并发安全
+/// + 需要想清楚哪些操作必须是原子的，必须按顺序来，否则会出问题
+/// + 比如多个协程都需要执行 async_read，这时候需要往虚拟队列中添加描述符，然后通知设备，
+/// 如果添加描述符和通知设备两个操作不是原子的话，可能会出问题。（这里可能两个操作不应该是原子的，只是举个例子，说明系统里面可能会有这样的情况）
+/// 
+/// todo: 弄清楚哪些操作需要同步，哪些部分需要加锁
+
 
 use bitflags::bitflags;
 use volatile::Volatile;
@@ -19,8 +34,10 @@ use super::*;
 pub struct BlockFuture {
     /// 请求类型
     /// 0 表示读，1 表示写
+    /// unused
     _req_type: u8,
-    /// 该块设备的虚拟队列，用于 poll 操作的时候判断请求是否完成
+    /// 该块设备的内部结构，用于 poll 操作的时候判断请求是否完成
+    /// 如果完成了也会对这里的值做相关处理
     inner: Arc<Mutex<VirtIOBlockInner>>,
     /// 块设备的回应，用于 poll 操作的时候从这里读取请求被处理的状态
     /// unused
@@ -29,6 +46,9 @@ pub struct BlockFuture {
 
 impl Future for BlockFuture {
     type Output = Result<()>;
+    // warn: 这里需要仔细考虑操作的原子性
+    // 目前的飓风内核里面的实现是对所有 Future 的操作加锁了，因此暂时不用考虑
+    // 将来的正式发布版本需要考虑这个问题
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // 这里对 status 的判断有很奇怪的 bug，先不对其进行判断
         let resp: NonNull<BlockResp> = self.response.cast();
@@ -50,13 +70,12 @@ impl Future for BlockFuture {
     }
 }
 
-// todo: 检查这里的安全性
 unsafe impl Send for BlockFuture {}
-// 所有公有成员都是 sync 的
 unsafe impl Sync for BlockFuture {}
 
 /// 虚拟块设备
 pub struct VirtIOBlock {
+    /// 块设备的内部内容
     inner: Arc<Mutex<VirtIOBlockInner>>,
     /// 容量
     capacity: usize
@@ -160,7 +179,7 @@ impl VirtIOBlock {
     }
 
     /// 以异步方式读取一个块
-    /// 这里对 self 进行不可变引用而不是可变引用
+    /// todo: 仔细考虑这里的操作原子性
     pub fn async_read(&self, block_id: usize, buf: &mut [u8]) -> BlockFuture {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
@@ -186,6 +205,7 @@ impl VirtIOBlock {
     }
 
     /// 以异步方式写入一个块
+    /// todo: 仔细考虑这里的操作原子性
     pub fn async_write(&self, block_id: usize, buf: &[u8]) -> BlockFuture {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
@@ -265,6 +285,7 @@ impl VirtIOBlock {
     }
 
     /// 处理 virtio 外部中断
+    /// todo: 仔细考虑这里的操作原子性
     pub unsafe fn handle_interrupt(&self) -> Result<InterruptRet> {
         let mut inner = self.inner.lock();
         let (h, q) = inner.header_and_queue_mut();
