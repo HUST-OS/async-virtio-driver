@@ -256,7 +256,7 @@ impl VirtQueue {
         let last_used_slot = self.last_used_index & (self.queue_size - 1);
         let index = used_ring.ring[last_used_slot as usize].id.read() as u16;
         let len = used_ring.ring[last_used_slot as usize].len.read();
-
+        
         self.recycle_descriptors(index);
         self.last_used_index = self.last_used_index.wrapping_add(1);
 
@@ -280,6 +280,10 @@ impl VirtQueue {
         Ok((index, len))
     }
 
+    pub fn free_head(&self) -> u16 {
+        self.free_desc_head
+    }
+    
     pub fn descriptor(&self, index: usize) -> Descriptor {
         unsafe { self.descriptor_table.as_ref()[index].clone() }
     }

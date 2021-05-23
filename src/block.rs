@@ -40,27 +40,35 @@ pub struct BlockFuture {
     /// 如果完成了也会对这里的值做相关处理
     inner: Arc<Mutex<VirtIOBlockInner>>,
     /// IO 请求的描述符链头部
-    head: u16
+    head: u16,
+    req: NonNull<BlockReq>
 }
 
 impl Future for BlockFuture {
     type Output = Result<()>;
     // warn: 这里需要仔细考虑操作的原子性
-    // 目前的飓风内核里面的实现是对所有 Future 的操作加锁了，因此暂时不用考虑
-    // 将来的正式发布版本需要考虑这个问题
+    // 这里可能有外部中断进入
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // 这里对 status 的判断有很奇怪的 bug，先不对其进行判断
         let mut inner = self.inner.lock();
         let (h, q) = inner.header_and_queue_mut();
-        let desc_link = q.descriptor_link(self.head);
-        println!("[virtio] poll in BlockFuture! desc_link: {:?}", desc_link);
-        let resp_desc = desc_link[2];
-        println!("response descriptor: {:?}", resp_desc);
         match q.can_pop() {
             true => {
-                let intr_status = h.interrupt_status();
-                println!("interrupt status: {}", intr_status);   
-                q.pop_used()?;
+                let pop_ret = q.pop_used()?;
+                println!("[virtio] pop queue ret: {:?}", pop_ret);
+                assert_eq!(self.head, pop_ret.0);
+                let desc_link = q.descriptor_link(self.head);
+                println!("[virtio] poll in BlockFuture! desc_link: {:x?}", desc_link);
+                let req_desc = desc_link[0];
+                println!("request descriptor: {:x?}", req_desc);
+                unsafe {
+                    let req_ptr = virtio_phys_to_virt(req_desc.paddr.read() as usize);
+                    let req = &*(req_ptr as *const BlockReq);
+                    println!("[virtio] poll, req_ptr: {:#x}, req: {:#x?}", req_ptr, req);
+                    let req_arc_ptr = self.req.as_ref() as *const _ as usize;
+                    println!("[virtio] poll, req_arc_ptr: {:#x}, req: {:#x?}", req_arc_ptr, self.req.as_ref());
+                }
+                let intr_ret = h.ack_interrupt();
+                println!("[virtio] ack interrupt {}", intr_ret);
                 Poll::Ready(Ok(()))
             }
             false => {
@@ -90,7 +98,9 @@ pub struct VirtIOBlockInner {
     /// MMIO 头部
     pub header: &'static mut VirtIOHeader,
     /// 虚拟队列
-    pub queue: VirtQueue
+    pub queue: VirtQueue,
+    /// IO 请求池
+    pub req_pool: [BlockReq; VIRT_QUEUE_SIZE]
 }
 
 impl VirtIOBlockInner {
@@ -100,6 +110,14 @@ impl VirtIOBlockInner {
 
     pub fn header_and_queue_mut(&mut self) -> (&mut VirtIOHeader, &mut VirtQueue) {
         (&mut self.header, &mut self.queue)
+    }
+
+    pub fn header_queue_req_pool(&self) -> (&VirtIOHeader, &VirtQueue, &[BlockReq]) {
+        (self.header, &self.queue, &self.req_pool)
+    }
+
+    pub fn header_queue_req_pool_mut(&mut self) -> (&mut VirtIOHeader, &mut VirtQueue, &mut [BlockReq]) {
+        (self.header, &mut self.queue, &mut self.req_pool)
     }
 }
 
@@ -133,8 +151,11 @@ impl VirtIOBlock {
 
         header.finish_init();
 
-        let inner = VirtIOBlockInner { header, queue };
+        let req_pool = [BlockReq {type_: BlockReqType::Discard, reserved: 0, sector: 0}; VIRT_QUEUE_SIZE];
 
+        let inner = VirtIOBlockInner { header, queue, req_pool };
+        
+        
         Ok(VirtIOBlock {
             inner: Arc::new(Mutex::new(inner)),
             capacity: config.capacity.read() as usize
@@ -169,10 +190,13 @@ impl VirtIOBlock {
 
         header.finish_init();
 
-        let inner = VirtIOBlockInner { header, queue };
+        let req_pool = [BlockReq {type_: BlockReqType::Discard, reserved: 0, sector: 0}; VIRT_QUEUE_SIZE];
+        
+        let inner = VirtIOBlockInner { header, queue, req_pool };
+
         Ok(VirtIOBlock {
             inner: Arc::new(Mutex::new(inner)),
-            capacity: config.capacity.read() as usize
+            capacity: config.capacity.read() as usize,
         })
     }
 
@@ -187,20 +211,18 @@ impl VirtIOBlock {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
-        let req = BlockReq {
-            type_: BlockReqType::In,
-            reserved: 0,
-            sector: block_id as u64
-        };
         let mut resp = BlockResp::default();
         let mut inner = self.inner.lock();
-        let (h, q) = inner.header_and_queue_mut();
+        let (h, q, r) = inner.header_queue_req_pool_mut();
+        let free_head = q.free_head();
+        let req = &mut r[free_head as usize];
+        req.type_ = BlockReqType::In;
+        req.reserved = 0;
+        req.sector = block_id as u64;
         q.desc_table()
             .iter()
             .filter(|d| d.paddr.read() != 0)
             .for_each(|d| println!("{:#x?}", d));
-        println!("{:#x?}", q.avail_ring());
-        println!("{:#x?}", q.used_ring());
         let head = q.add_buf(&[req.as_buf()], &[buf, resp.as_buf_mut()])
             .expect("[virtio] virtual queue add buf error");
     
@@ -208,14 +230,15 @@ impl VirtIOBlock {
             .iter()
             .filter(|d| d.paddr.read() != 0)
             .for_each(|d| println!("{:#x?}", d));
-        println!("{:#x?}", q.avail_ring());
-        println!("{:#x?}", q.used_ring());
-        h.notify(0);
 
+        let req_ptr = req.as_buf() as *const _ as *mut BlockReq;
+        println!("[virtio] async_read, req_ptr: {:#x}", req_ptr as usize);
+        h.notify(0);
         BlockFuture {
             _req_type: 0,
             inner: Arc::clone(&self.inner),
-            head
+            head,
+            req: NonNull::new(req_ptr).unwrap()
         }
     }
 
@@ -225,20 +248,19 @@ impl VirtIOBlock {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
-        let req = BlockReq {
-            type_: BlockReqType::Out,
-            reserved: 0,
-            sector: block_id as u64,
-        };
+        
         let mut resp = BlockResp::default();
         let mut inner = self.inner.lock();
-        let (h, q) = inner.header_and_queue_mut();
+        let (h, q, r) = inner.header_queue_req_pool_mut();
+        let free_head = q.free_head();
+        let req = &mut r[free_head as usize];
+        req.type_ = BlockReqType::In;
+        req.reserved = 0;
+        req.sector = block_id as u64;
         q.desc_table()
             .iter()
             .filter(|d| d.paddr.read() != 0)
             .for_each(|d| println!("{:#x?}", d));
-        println!("{:#x?}", q.avail_ring());
-        println!("{:#x?}", q.used_ring());
         let head = q.add_buf(&[req.as_buf(), buf], &[resp.as_buf_mut()])
             .expect("[virtio] virtual queue add buf error");
 
@@ -246,14 +268,15 @@ impl VirtIOBlock {
             .iter()
             .filter(|d| d.paddr.read() != 0)
             .for_each(|d| println!("{:#x?}", d));
-        println!("{:#x?}", q.avail_ring());
-        println!("{:#x?}", q.used_ring());
-        h.notify(0);
+        let req_ptr = req.as_buf() as *const _ as *mut BlockReq;
+        println!("[virtio] async_read, req_ptr: {:#x}", req_ptr as usize);
         
+        h.notify(0);
         BlockFuture {
             _req_type: 1,
             inner: Arc::clone(&self.inner),
-            head
+            head,
+            req: NonNull::new(req_ptr).unwrap()
         }
     }
 
@@ -315,25 +338,21 @@ impl VirtIOBlock {
     /// todo: 仔细考虑这里的操作原子性
     pub unsafe fn handle_interrupt(&self) -> Result<InterruptRet> {
         let mut inner = self.inner.lock();
-        let (h, q) = inner.header_and_queue_mut();
+        let (_h, q) = inner.header_and_queue_mut();
         if !q.can_pop() {
             return Err(VirtIOError::IOError);
         }
         let (index, _len) = q.next_used()?;
         let desc = q.descriptor(index as usize);
         let desc_va = virtio_phys_to_virt(desc.paddr.read() as usize);
+        println!("[virtio] handle interrupt: desc_pa: {:#x}, desc_va: {:#x}", desc.paddr.read(), desc_va);
         let req = &*(desc_va as *const BlockReq);
         let ret = match req.type_ {
             BlockReqType::In => InterruptRet::Read(req.sector as usize),
             BlockReqType::Out => InterruptRet::Write(req.sector as usize),
             _ => InterruptRet::Other
         };
-        // 通知设备外部中断已处理
-        if h.ack_interrupt() {
-            return Ok(ret)
-        } else {
-            return Err(VirtIOError::AckInterruptError)
-        }
+        Ok(ret)
     }
 }
 
@@ -409,7 +428,7 @@ struct BlockConfig {
 /// 块设备请求
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct BlockReq {
+pub struct BlockReq {
     type_: BlockReqType,
     reserved: u32,
     sector: u64
@@ -423,7 +442,7 @@ struct BlockResp {
 }
 
 /// 块设备请求类型
-#[repr(C)]
+#[repr(u32)]
 #[derive(Debug, Clone, Copy)]
 enum BlockReqType {
     In = 0,
@@ -454,6 +473,7 @@ impl Default for BlockResp {
 unsafe impl AsBuf for BlockReq {}
 unsafe impl AsBuf for BlockResp {}
 
+#[derive(Debug)]
 /// 中断响应返回值
 pub enum InterruptRet {
     /// 读请求完成的块
