@@ -23,6 +23,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::ptr::NonNull;
+use core::cell::RefCell;
 use spin::Mutex;
 use alloc::sync::Arc;
 use super::mmio::VirtIOHeader;
@@ -32,16 +33,17 @@ use super::config::*;
 use super::*;
 
 pub struct BlockFuture {
-    /// 请求类型
-    /// 0 表示读，1 表示写
-    /// unused
-    _req_type: u8,
     /// 该块设备的内部结构，用于 poll 操作的时候判断请求是否完成
     /// 如果完成了也会对这里的值做相关处理
     inner: Arc<Mutex<VirtIOBlockInner>>,
     /// IO 请求的描述符链头部
     head: u16,
-    req: NonNull<BlockReq>
+    /// IO 请求缓冲区
+    req: NonNull<BlockReq>,
+    /// IO 回应缓冲区
+    resp: NonNull<BlockResp>,
+    /// 是否是第一次 poll
+    first_poll: RefCell<bool>
 }
 
 impl Future for BlockFuture {
@@ -51,24 +53,32 @@ impl Future for BlockFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut inner = self.inner.lock();
         let (h, q) = inner.header_and_queue_mut();
+        unsafe {
+            // 如果是第一次 Poll，则通知设备，直接返回 Pending
+            if *(self.first_poll.as_ptr()) {
+                // println!("[virtio] first poll, return pending");
+                h.notify(0);
+                *(self.first_poll.borrow_mut()) = false;
+                return Poll::Pending;
+            }
+        }
         match q.can_pop() {
             true => {
                 let pop_ret = q.pop_used()?;
                 println!("[virtio] pop queue ret: {:?}", pop_ret);
                 assert_eq!(self.head, pop_ret.0);
                 let desc_link = q.descriptor_link(self.head);
-                println!("[virtio] poll in BlockFuture! desc_link: {:x?}", desc_link);
                 let req_desc = desc_link[0];
-                println!("request descriptor: {:x?}", req_desc);
                 unsafe {
                     let req_ptr = virtio_phys_to_virt(req_desc.paddr.read() as usize);
                     let req = &*(req_ptr as *const BlockReq);
                     println!("[virtio] poll, req_ptr: {:#x}, req: {:#x?}", req_ptr, req);
-                    let req_arc_ptr = self.req.as_ref() as *const _ as usize;
-                    println!("[virtio] poll, req_arc_ptr: {:#x}, req: {:#x?}", req_arc_ptr, self.req.as_ref());
+                    let req_nonnull_ptr = self.req.as_ref() as *const _ as usize;
+                    println!("[virtio] poll, req_nonnull_ptr: {:#x}, req: {:#x?}", req_nonnull_ptr, self.req.as_ref());
+                    let resp_nonnull_ptr = self.resp.as_ref() as *const _ as usize;
+                    println!("[virtio] poll, resp_nonnull_ptr: {:#x}, resp: {:#x?}", resp_nonnull_ptr, self.resp.as_ref());
                 }
                 let intr_ret = h.ack_interrupt();
-                println!("[virtio] ack interrupt {}", intr_ret);
                 Poll::Ready(Ok(()))
             }
             false => {
@@ -100,7 +110,9 @@ pub struct VirtIOBlockInner {
     /// 虚拟队列
     pub queue: VirtQueue,
     /// IO 请求池
-    pub req_pool: [BlockReq; VIRT_QUEUE_SIZE]
+    pub req_pool: [BlockReq; VIRT_QUEUE_SIZE],
+    /// IO 回应池
+    pub resp_pool: [BlockResp; VIRT_QUEUE_SIZE]
 }
 
 impl VirtIOBlockInner {
@@ -112,12 +124,12 @@ impl VirtIOBlockInner {
         (&mut self.header, &mut self.queue)
     }
 
-    pub fn header_queue_req_pool(&self) -> (&VirtIOHeader, &VirtQueue, &[BlockReq]) {
-        (self.header, &self.queue, &self.req_pool)
+    pub fn header_queue_req_resp(&self) -> (&VirtIOHeader, &VirtQueue, &[BlockReq], &[BlockResp]) {
+        (self.header, &self.queue, &self.req_pool, &self.resp_pool)
     }
 
-    pub fn header_queue_req_pool_mut(&mut self) -> (&mut VirtIOHeader, &mut VirtQueue, &mut [BlockReq]) {
-        (self.header, &mut self.queue, &mut self.req_pool)
+    pub fn header_queue_req_resp_mut(&mut self) -> (&mut VirtIOHeader, &mut VirtQueue, &mut [BlockReq], &mut [BlockResp]) {
+        (self.header, &mut self.queue, &mut self.req_pool, &mut self.resp_pool)
     }
 }
 
@@ -152,8 +164,9 @@ impl VirtIOBlock {
         header.finish_init();
 
         let req_pool = [BlockReq {type_: BlockReqType::Discard, reserved: 0, sector: 0}; VIRT_QUEUE_SIZE];
+        let resp_pool = [BlockResp::default(); VIRT_QUEUE_SIZE];
 
-        let inner = VirtIOBlockInner { header, queue, req_pool };
+        let inner = VirtIOBlockInner { header, queue, req_pool, resp_pool };
         
         
         Ok(VirtIOBlock {
@@ -191,8 +204,9 @@ impl VirtIOBlock {
         header.finish_init();
 
         let req_pool = [BlockReq {type_: BlockReqType::Discard, reserved: 0, sector: 0}; VIRT_QUEUE_SIZE];
-        
-        let inner = VirtIOBlockInner { header, queue, req_pool };
+        let resp_pool = [BlockResp::default(); VIRT_QUEUE_SIZE];
+
+        let inner = VirtIOBlockInner { header, queue, req_pool, resp_pool };
 
         Ok(VirtIOBlock {
             inner: Arc::new(Mutex::new(inner)),
@@ -211,34 +225,37 @@ impl VirtIOBlock {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
-        let mut resp = BlockResp::default();
         let mut inner = self.inner.lock();
-        let (h, q, r) = inner.header_queue_req_pool_mut();
+        let (_h, q, reqs, resps) = inner.header_queue_req_resp_mut();
+        // 空闲描述符表的头部
         let free_head = q.free_head();
-        let req = &mut r[free_head as usize];
+        
+        // IO 请求
+        let req = &mut reqs[free_head as usize];
         req.type_ = BlockReqType::In;
         req.reserved = 0;
         req.sector = block_id as u64;
-        q.desc_table()
-            .iter()
-            .filter(|d| d.paddr.read() != 0)
-            .for_each(|d| println!("{:#x?}", d));
+        
+        // IO 回应
+        let resp = &mut resps[free_head as usize];
+
         let head = q.add_buf(&[req.as_buf()], &[buf, resp.as_buf_mut()])
             .expect("[virtio] virtual queue add buf error");
     
-        q.desc_table()
-            .iter()
-            .filter(|d| d.paddr.read() != 0)
-            .for_each(|d| println!("{:#x?}", d));
+        // q.desc_table().iter().filter(|d| d.paddr.read() != 0)
+        //     .for_each(|d| println!("{:#x?}", d));
 
         let req_ptr = req.as_buf() as *const _ as *mut BlockReq;
-        println!("[virtio] async_read, req_ptr: {:#x}", req_ptr as usize);
-        h.notify(0);
+        let resp_ptr = resp.as_buf() as *const _ as *mut BlockResp;
+
+        // 不在这里通知设备，在 BlockFuture 第一次 poll 的时候通知
+        // h.notify(0);
         BlockFuture {
-            _req_type: 0,
             inner: Arc::clone(&self.inner),
             head,
-            req: NonNull::new(req_ptr).unwrap()
+            req: NonNull::new(req_ptr).unwrap(),
+            resp: NonNull::new(resp_ptr).unwrap(),
+            first_poll: RefCell::new(true)
         }
     }
 
@@ -249,34 +266,39 @@ impl VirtIOBlock {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
         
-        let mut resp = BlockResp::default();
         let mut inner = self.inner.lock();
-        let (h, q, r) = inner.header_queue_req_pool_mut();
+        let (_h, q, reqs, resps) = inner.header_queue_req_resp_mut();
+    
+        // 空闲描述符表头部
         let free_head = q.free_head();
-        let req = &mut r[free_head as usize];
-        req.type_ = BlockReqType::In;
+        
+        // IO 请求
+        let req = &mut reqs[free_head as usize];
+        req.type_ = BlockReqType::Out;
         req.reserved = 0;
         req.sector = block_id as u64;
-        q.desc_table()
-            .iter()
-            .filter(|d| d.paddr.read() != 0)
-            .for_each(|d| println!("{:#x?}", d));
+        
+        // IO 回应
+        let resp = &mut resps[free_head as usize];
+        
         let head = q.add_buf(&[req.as_buf(), buf], &[resp.as_buf_mut()])
             .expect("[virtio] virtual queue add buf error");
 
-        q.desc_table()
-            .iter()
-            .filter(|d| d.paddr.read() != 0)
-            .for_each(|d| println!("{:#x?}", d));
-        let req_ptr = req.as_buf() as *const _ as *mut BlockReq;
-        println!("[virtio] async_read, req_ptr: {:#x}", req_ptr as usize);
+        // q.desc_table().iter().filter(|d| d.paddr.read() != 0)
+        //     .for_each(|d| println!("{:#x?}", d));
         
-        h.notify(0);
+        let req_ptr = req.as_buf() as *const _ as *mut BlockReq;
+        let resp_ptr = resp.as_buf() as *const _ as *mut BlockResp;
+        
+        // 不在这里通知设备，在 BlockFuture 第一次 poll 的时候通知
+        // h.notify(0);
+        
         BlockFuture {
-            _req_type: 1,
             inner: Arc::clone(&self.inner),
             head,
-            req: NonNull::new(req_ptr).unwrap()
+            req: NonNull::new(req_ptr).unwrap(),
+            resp: NonNull::new(resp_ptr).unwrap(),
+            first_poll: RefCell::new(true)
         }
     }
 
@@ -436,8 +458,8 @@ pub struct BlockReq {
 
 /// 块设备回应
 #[repr(C)]
-#[derive(Debug)]
-struct BlockResp {
+#[derive(Debug, Clone, Copy)]
+pub struct BlockResp {
     status: BlockRespStatus,
 }
 
