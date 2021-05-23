@@ -241,9 +241,6 @@ impl VirtIOBlock {
         let head = q.add_buf(&[req.as_buf()], &[buf, resp.as_buf_mut()])
             .expect("[virtio] virtual queue add buf error");
     
-        // q.desc_table().iter().filter(|d| d.paddr.read() != 0)
-        //     .for_each(|d| println!("{:#x?}", d));
-
         let req_ptr = req.as_buf() as *const _ as *mut BlockReq;
         let resp_ptr = resp.as_buf() as *const _ as *mut BlockResp;
 
@@ -283,9 +280,6 @@ impl VirtIOBlock {
         let head = q.add_buf(&[req.as_buf(), buf], &[resp.as_buf_mut()])
             .expect("[virtio] virtual queue add buf error");
 
-        // q.desc_table().iter().filter(|d| d.paddr.read() != 0)
-        //     .for_each(|d| println!("{:#x?}", d));
-        
         let req_ptr = req.as_buf() as *const _ as *mut BlockReq;
         let resp_ptr = resp.as_buf() as *const _ as *mut BlockResp;
         
@@ -301,6 +295,7 @@ impl VirtIOBlock {
         }
     }
 
+    /// unused
     pub fn read_block(&self, block_id: usize, buf: &mut [u8]) -> Result<()> {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
@@ -328,6 +323,7 @@ impl VirtIOBlock {
         }
     }
 
+    /// unused
     pub fn write_block(&self, block_id: usize, buf: &[u8]) -> Result<()> {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
