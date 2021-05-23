@@ -39,9 +39,8 @@ pub struct BlockFuture {
     /// 该块设备的内部结构，用于 poll 操作的时候判断请求是否完成
     /// 如果完成了也会对这里的值做相关处理
     inner: Arc<Mutex<VirtIOBlockInner>>,
-    /// 块设备的回应，用于 poll 操作的时候从这里读取请求被处理的状态
-    /// unused
-    response: NonNull<()>,
+    /// IO 请求的描述符链头部
+    head: u16
 }
 
 impl Future for BlockFuture {
@@ -51,12 +50,16 @@ impl Future for BlockFuture {
     // 将来的正式发布版本需要考虑这个问题
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // 这里对 status 的判断有很奇怪的 bug，先不对其进行判断
-        let resp: NonNull<BlockResp> = self.response.cast();
-        let status = unsafe { *&resp.as_ref().status };
         let mut inner = self.inner.lock();
-        let (_h, q) = inner.header_and_queue_mut();
+        let (h, q) = inner.header_and_queue_mut();
+        let desc_link = q.descriptor_link(self.head);
+        println!("[virtio] poll in BlockFuture! desc_link: {:?}", desc_link);
+        let resp_desc = desc_link[2];
+        println!("response descriptor: {:?}", resp_desc);
         match q.can_pop() {
             true => {
+                let intr_status = h.interrupt_status();
+                println!("interrupt status: {}", intr_status);   
                 q.pop_used()?;
                 Poll::Ready(Ok(()))
             }
@@ -192,15 +195,27 @@ impl VirtIOBlock {
         let mut resp = BlockResp::default();
         let mut inner = self.inner.lock();
         let (h, q) = inner.header_and_queue_mut();
-        q.add_buf(&[req.as_buf()], &[buf, resp.as_buf_mut()])
+        q.desc_table()
+            .iter()
+            .filter(|d| d.paddr.read() != 0)
+            .for_each(|d| println!("{:#x?}", d));
+        println!("{:#x?}", q.avail_ring());
+        println!("{:#x?}", q.used_ring());
+        let head = q.add_buf(&[req.as_buf()], &[buf, resp.as_buf_mut()])
             .expect("[virtio] virtual queue add buf error");
     
+        q.desc_table()
+            .iter()
+            .filter(|d| d.paddr.read() != 0)
+            .for_each(|d| println!("{:#x?}", d));
+        println!("{:#x?}", q.avail_ring());
+        println!("{:#x?}", q.used_ring());
         h.notify(0);
 
         BlockFuture {
             _req_type: 0,
             inner: Arc::clone(&self.inner),
-            response: NonNull::new(&resp as *const _ as *mut ()).unwrap()
+            head
         }
     }
 
@@ -218,15 +233,27 @@ impl VirtIOBlock {
         let mut resp = BlockResp::default();
         let mut inner = self.inner.lock();
         let (h, q) = inner.header_and_queue_mut();
-        q.add_buf(&[req.as_buf(), buf], &[resp.as_buf_mut()])
+        q.desc_table()
+            .iter()
+            .filter(|d| d.paddr.read() != 0)
+            .for_each(|d| println!("{:#x?}", d));
+        println!("{:#x?}", q.avail_ring());
+        println!("{:#x?}", q.used_ring());
+        let head = q.add_buf(&[req.as_buf(), buf], &[resp.as_buf_mut()])
             .expect("[virtio] virtual queue add buf error");
 
+        q.desc_table()
+            .iter()
+            .filter(|d| d.paddr.read() != 0)
+            .for_each(|d| println!("{:#x?}", d));
+        println!("{:#x?}", q.avail_ring());
+        println!("{:#x?}", q.used_ring());
         h.notify(0);
         
         BlockFuture {
             _req_type: 1,
             inner: Arc::clone(&self.inner),
-            response: NonNull::new(&resp as *const _ as *mut ()).unwrap()
+            head
         }
     }
 
