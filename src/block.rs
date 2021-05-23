@@ -23,6 +23,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::ptr::NonNull;
+use core::cell::RefCell;
 use spin::Mutex;
 use alloc::sync::Arc;
 use super::mmio::VirtIOHeader;
@@ -32,33 +33,52 @@ use super::config::*;
 use super::*;
 
 pub struct BlockFuture {
-    /// 请求类型
-    /// 0 表示读，1 表示写
-    /// unused
-    _req_type: u8,
     /// 该块设备的内部结构，用于 poll 操作的时候判断请求是否完成
     /// 如果完成了也会对这里的值做相关处理
     inner: Arc<Mutex<VirtIOBlockInner>>,
-    /// 块设备的回应，用于 poll 操作的时候从这里读取请求被处理的状态
-    /// unused
-    response: NonNull<()>,
+    /// IO 请求的描述符链头部
+    head: u16,
+    /// IO 请求缓冲区
+    req: NonNull<BlockReq>,
+    /// IO 回应缓冲区
+    resp: NonNull<BlockResp>,
+    /// 是否是第一次 poll
+    first_poll: RefCell<bool>
 }
 
 impl Future for BlockFuture {
     type Output = Result<()>;
     // warn: 这里需要仔细考虑操作的原子性
-    // 目前的飓风内核里面的实现是对所有 Future 的操作加锁了，因此暂时不用考虑
-    // 将来的正式发布版本需要考虑这个问题
+    // 这里可能有外部中断进入
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // 这里对 status 的判断有很奇怪的 bug，先不对其进行判断
-        let resp: NonNull<BlockResp> = self.response.cast();
-        let status = unsafe { *&resp.as_ref().status };
         let mut inner = self.inner.lock();
-        let (_h, q) = inner.header_and_queue_mut();
+        let (h, q) = inner.header_and_queue_mut();
+        unsafe {
+            // 如果是第一次 Poll，则通知设备，直接返回 Pending
+            if *(self.first_poll.as_ptr()) {
+                // println!("[virtio] first poll, return pending");
+                h.notify(0);
+                *(self.first_poll.borrow_mut()) = false;
+                return Poll::Pending;
+            }
+        }
         match q.can_pop() {
             true => {
-                q.pop_used()?;
-                Poll::Ready(Ok(()))
+                let pop_ret = q.pop_used()?;
+                assert_eq!(self.head, pop_ret.0);
+                unsafe {
+                    let resp = *self.resp.as_ptr();
+                    match resp.status {
+                        BlockRespStatus::Ok => {
+                            if h.ack_interrupt() {
+                                return Poll::Ready(Ok(()))
+                            } else {
+                                return Poll::Ready(Err(VirtIOError::AckInterruptError))
+                            }
+                        },
+                        _ => return Poll::Ready(Err(VirtIOError::DeciveResponseError))
+                    }
+                }
             }
             false => {
                 // 这里不进行唤醒，直接返回 pending
@@ -87,7 +107,11 @@ pub struct VirtIOBlockInner {
     /// MMIO 头部
     pub header: &'static mut VirtIOHeader,
     /// 虚拟队列
-    pub queue: VirtQueue
+    pub queue: VirtQueue,
+    /// IO 请求池
+    pub req_pool: [BlockReq; VIRT_QUEUE_SIZE],
+    /// IO 回应池
+    pub resp_pool: [BlockResp; VIRT_QUEUE_SIZE]
 }
 
 impl VirtIOBlockInner {
@@ -97,6 +121,14 @@ impl VirtIOBlockInner {
 
     pub fn header_and_queue_mut(&mut self) -> (&mut VirtIOHeader, &mut VirtQueue) {
         (&mut self.header, &mut self.queue)
+    }
+
+    pub fn header_queue_req_resp(&self) -> (&VirtIOHeader, &VirtQueue, &[BlockReq], &[BlockResp]) {
+        (self.header, &self.queue, &self.req_pool, &self.resp_pool)
+    }
+
+    pub fn header_queue_req_resp_mut(&mut self) -> (&mut VirtIOHeader, &mut VirtQueue, &mut [BlockReq], &mut [BlockResp]) {
+        (self.header, &mut self.queue, &mut self.req_pool, &mut self.resp_pool)
     }
 }
 
@@ -130,8 +162,12 @@ impl VirtIOBlock {
 
         header.finish_init();
 
-        let inner = VirtIOBlockInner { header, queue };
+        let req_pool = [BlockReq {type_: BlockReqType::Discard, reserved: 0, sector: 0}; VIRT_QUEUE_SIZE];
+        let resp_pool = [BlockResp::default(); VIRT_QUEUE_SIZE];
 
+        let inner = VirtIOBlockInner { header, queue, req_pool, resp_pool };
+        
+        
         Ok(VirtIOBlock {
             inner: Arc::new(Mutex::new(inner)),
             capacity: config.capacity.read() as usize
@@ -166,10 +202,14 @@ impl VirtIOBlock {
 
         header.finish_init();
 
-        let inner = VirtIOBlockInner { header, queue };
+        let req_pool = [BlockReq {type_: BlockReqType::Discard, reserved: 0, sector: 0}; VIRT_QUEUE_SIZE];
+        let resp_pool = [BlockResp::default(); VIRT_QUEUE_SIZE];
+
+        let inner = VirtIOBlockInner { header, queue, req_pool, resp_pool };
+
         Ok(VirtIOBlock {
             inner: Arc::new(Mutex::new(inner)),
-            capacity: config.capacity.read() as usize
+            capacity: config.capacity.read() as usize,
         })
     }
 
@@ -184,23 +224,34 @@ impl VirtIOBlock {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
-        let req = BlockReq {
-            type_: BlockReqType::In,
-            reserved: 0,
-            sector: block_id as u64
-        };
-        let mut resp = BlockResp::default();
         let mut inner = self.inner.lock();
-        let (h, q) = inner.header_and_queue_mut();
-        q.add_buf(&[req.as_buf()], &[buf, resp.as_buf_mut()])
+        let (_h, q, reqs, resps) = inner.header_queue_req_resp_mut();
+        // 空闲描述符表的头部
+        let free_head = q.free_head();
+        
+        // IO 请求
+        let req = &mut reqs[free_head as usize];
+        req.type_ = BlockReqType::In;
+        req.reserved = 0;
+        req.sector = block_id as u64;
+        
+        // IO 回应
+        let resp = &mut resps[free_head as usize];
+
+        let head = q.add_buf(&[req.as_buf()], &[buf, resp.as_buf_mut()])
             .expect("[virtio] virtual queue add buf error");
     
-        h.notify(0);
+        let req_ptr = req.as_buf() as *const _ as *mut BlockReq;
+        let resp_ptr = resp.as_buf() as *const _ as *mut BlockResp;
 
+        // 不在这里通知设备，在 BlockFuture 第一次 poll 的时候通知
+        // h.notify(0);
         BlockFuture {
-            _req_type: 0,
             inner: Arc::clone(&self.inner),
-            response: NonNull::new(&resp as *const _ as *mut ()).unwrap()
+            head,
+            req: NonNull::new(req_ptr).unwrap(),
+            resp: NonNull::new(resp_ptr).unwrap(),
+            first_poll: RefCell::new(true)
         }
     }
 
@@ -210,26 +261,41 @@ impl VirtIOBlock {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
         }
-        let req = BlockReq {
-            type_: BlockReqType::Out,
-            reserved: 0,
-            sector: block_id as u64,
-        };
-        let mut resp = BlockResp::default();
+        
         let mut inner = self.inner.lock();
-        let (h, q) = inner.header_and_queue_mut();
-        q.add_buf(&[req.as_buf(), buf], &[resp.as_buf_mut()])
+        let (_h, q, reqs, resps) = inner.header_queue_req_resp_mut();
+    
+        // 空闲描述符表头部
+        let free_head = q.free_head();
+        
+        // IO 请求
+        let req = &mut reqs[free_head as usize];
+        req.type_ = BlockReqType::Out;
+        req.reserved = 0;
+        req.sector = block_id as u64;
+        
+        // IO 回应
+        let resp = &mut resps[free_head as usize];
+        
+        let head = q.add_buf(&[req.as_buf(), buf], &[resp.as_buf_mut()])
             .expect("[virtio] virtual queue add buf error");
 
-        h.notify(0);
+        let req_ptr = req.as_buf() as *const _ as *mut BlockReq;
+        let resp_ptr = resp.as_buf() as *const _ as *mut BlockResp;
+        
+        // 不在这里通知设备，在 BlockFuture 第一次 poll 的时候通知
+        // h.notify(0);
         
         BlockFuture {
-            _req_type: 1,
             inner: Arc::clone(&self.inner),
-            response: NonNull::new(&resp as *const _ as *mut ()).unwrap()
+            head,
+            req: NonNull::new(req_ptr).unwrap(),
+            resp: NonNull::new(resp_ptr).unwrap(),
+            first_poll: RefCell::new(true)
         }
     }
 
+    /// unused
     pub fn read_block(&self, block_id: usize, buf: &mut [u8]) -> Result<()> {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
@@ -257,6 +323,7 @@ impl VirtIOBlock {
         }
     }
 
+    /// unused
     pub fn write_block(&self, block_id: usize, buf: &[u8]) -> Result<()> {
         if buf.len() != BLOCK_SIZE {
             panic!("[virtio] buffer size must equal to block size - 512!");
@@ -288,25 +355,21 @@ impl VirtIOBlock {
     /// todo: 仔细考虑这里的操作原子性
     pub unsafe fn handle_interrupt(&self) -> Result<InterruptRet> {
         let mut inner = self.inner.lock();
-        let (h, q) = inner.header_and_queue_mut();
+        let (_h, q) = inner.header_and_queue_mut();
         if !q.can_pop() {
             return Err(VirtIOError::IOError);
         }
         let (index, _len) = q.next_used()?;
         let desc = q.descriptor(index as usize);
         let desc_va = virtio_phys_to_virt(desc.paddr.read() as usize);
+        println!("[virtio] handle interrupt: desc_pa: {:#x}, desc_va: {:#x}", desc.paddr.read(), desc_va);
         let req = &*(desc_va as *const BlockReq);
         let ret = match req.type_ {
             BlockReqType::In => InterruptRet::Read(req.sector as usize),
             BlockReqType::Out => InterruptRet::Write(req.sector as usize),
             _ => InterruptRet::Other
         };
-        // 通知设备外部中断已处理
-        if h.ack_interrupt() {
-            return Ok(ret)
-        } else {
-            return Err(VirtIOError::AckInterruptError)
-        }
+        Ok(ret)
     }
 }
 
@@ -382,7 +445,7 @@ struct BlockConfig {
 /// 块设备请求
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct BlockReq {
+pub struct BlockReq {
     type_: BlockReqType,
     reserved: u32,
     sector: u64
@@ -390,13 +453,13 @@ struct BlockReq {
 
 /// 块设备回应
 #[repr(C)]
-#[derive(Debug)]
-struct BlockResp {
+#[derive(Debug, Clone, Copy)]
+pub struct BlockResp {
     status: BlockRespStatus,
 }
 
 /// 块设备请求类型
-#[repr(C)]
+#[repr(u32)]
 #[derive(Debug, Clone, Copy)]
 enum BlockReqType {
     In = 0,
@@ -427,6 +490,7 @@ impl Default for BlockResp {
 unsafe impl AsBuf for BlockReq {}
 unsafe impl AsBuf for BlockResp {}
 
+#[derive(Debug)]
 /// 中断响应返回值
 pub enum InterruptRet {
     /// 读请求完成的块

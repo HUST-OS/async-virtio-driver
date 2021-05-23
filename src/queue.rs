@@ -6,6 +6,7 @@ use volatile::Volatile;
 use bitflags::bitflags;
 use core::{mem::size_of, sync::atomic::{fence, Ordering}};
 use core::ptr::NonNull;
+use alloc::vec::Vec;
 use crate::util::align_up_page;
 use super::dma::DMA;
 use super::mmio::VirtIOHeader;
@@ -31,6 +32,7 @@ pub struct VirtQueue {
     /// 一个虚拟设备实现可能有多个虚拟队列
     queue_index: u32,
     /// 虚拟队列长度
+    /// 等于描述符表中条目的数量
     queue_size: u16,
     /// 已经使用的描述符数目
     used_num: u16,
@@ -162,26 +164,30 @@ impl VirtQueue {
         // 从空闲描述符表中分配描述符
         let head = self.free_desc_head;
         let mut tail = self.free_desc_head;
-        let mut self_free_desc_head = self.free_desc_head;
+        let mut next_free_desc_head = self.free_desc_head;
         let descriptor_table = unsafe { self.descriptor_table.as_mut() };
+        // 将输入缓冲区的信息写入描述符表
         inputs.iter().for_each(|input| {
-            let desc = &mut descriptor_table[self_free_desc_head as usize];
+            let desc = &mut descriptor_table[next_free_desc_head as usize];
             // 将 buffer 的信息写入描述符
             desc.set_buf(input);
             // 设置描述符的标识位
             desc.flags.write(DescriptorFlags::NEXT);
-            tail = self_free_desc_head;
-            self_free_desc_head = desc.next.read();
+            tail = next_free_desc_head;
+            next_free_desc_head = desc.next.read();
         });
-        self.free_desc_head = self_free_desc_head;
+        // 更新空闲描述符表头部
+        self.free_desc_head = next_free_desc_head;
+        // 将输出缓冲区的信息写入描述符表
         outputs.iter().for_each(|output| {
-            let desc = &mut descriptor_table[self_free_desc_head as usize];
+            let desc = &mut descriptor_table[next_free_desc_head as usize];
             desc.set_buf(output);
             desc.flags.write(DescriptorFlags::NEXT | DescriptorFlags::WRITE);
-            tail = self_free_desc_head;
-            self_free_desc_head = desc.next.read();
+            tail = next_free_desc_head;
+            next_free_desc_head = desc.next.read();
         });
-        self.free_desc_head = self_free_desc_head;
+        // 更新空闲描述符表头部
+        self.free_desc_head = next_free_desc_head;
         // 清除描述符链的最后一个元素的 next 指针
         {
             let desc = &mut descriptor_table[tail as usize];
@@ -208,7 +214,7 @@ impl VirtQueue {
 
     /// 是否可以从可用环中弹出没处理的项
     pub fn can_pop(&self) -> bool {
-        let used_ring = unsafe { self.used_ring.as_ref()  };
+        let used_ring = unsafe { self.used_ring.as_ref() };
         self.last_used_index != used_ring.idx.read()
     }
 
@@ -247,10 +253,10 @@ impl VirtQueue {
         fence(Ordering::SeqCst);
 
         let used_ring = unsafe { self.used_ring.as_mut() };
-        let last_used_slot = self.last_used_index &  (self.queue_size - 1);
+        let last_used_slot = self.last_used_index & (self.queue_size - 1);
         let index = used_ring.ring[last_used_slot as usize].id.read() as u16;
         let len = used_ring.ring[last_used_slot as usize].len.read();
-
+        
         self.recycle_descriptors(index);
         self.last_used_index = self.last_used_index.wrapping_add(1);
 
@@ -267,23 +273,58 @@ impl VirtQueue {
         fence(Ordering::SeqCst);
         
         let used_ring = unsafe { self.used_ring.as_ref() };
-        let last_used_slot = self.last_used_index &  (self.queue_size - 1);
+        let last_used_slot = self.last_used_index & (self.queue_size - 1);
         let index = used_ring.ring[last_used_slot as usize].id.read() as u16;
         let len = used_ring.ring[last_used_slot as usize].len.read();
 
         Ok((index, len))
     }
 
+    pub fn free_head(&self) -> u16 {
+        self.free_desc_head
+    }
+    
     pub fn descriptor(&self, index: usize) -> Descriptor {
         unsafe { self.descriptor_table.as_ref()[index].clone() }
     }
 
-    pub fn print_desc_table(&self) {
-        unsafe {
-            self.descriptor_table.as_ref().iter().for_each(|desc| {
-                println!("{:#x?}", desc);
-            });
+    pub fn desc_table(&self) -> &[Descriptor] {
+        unsafe { self.descriptor_table.as_ref() }
+    }
+
+    pub fn desc_table_mut(&mut self) -> &mut [Descriptor] {
+        unsafe { self.descriptor_table.as_mut() }
+    }
+
+    pub fn avail_ring(&self) -> &AvailableRing {
+        unsafe { self.avail_ring.as_ref() }
+    }
+
+    pub fn avail_ring_mut(&mut self) -> &mut AvailableRing {
+        unsafe { self.avail_ring.as_mut() }
+    }
+
+    pub fn used_ring(&self) -> &UsedRing {
+        unsafe {self.used_ring.as_ref() }
+    }
+
+    pub fn used_ring_mut(&mut self) -> &mut UsedRing {
+        unsafe { self.used_ring.as_mut() }
+    }
+
+    /// 返回给定头部的描述符链
+    pub fn descriptor_link(&self, head: u16) -> Vec<&Descriptor> {
+        let desc_table = self.desc_table();
+        let mut ret = Vec::new();
+        let mut pos = head;
+        while desc_table[pos as usize].flags.read().contains(DescriptorFlags::NEXT) {
+            let desc = &desc_table[pos as usize];
+            ret.push(desc);
+            pos = desc.next.read();
         }
+        // last one
+        ret.push(&desc_table[pos as usize]);
+        ret
     }
 }
 

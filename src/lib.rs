@@ -38,5 +38,7 @@ pub enum VirtIOError {
     /// 和数据没准备好却进入了外部中断处理方法
     IOError,
     /// 回应设备外部中断错误
-    AckInterruptError
+    AckInterruptError,
+    /// 设备回应错误
+    DeciveResponseError
 }
