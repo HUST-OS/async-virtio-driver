@@ -65,21 +65,20 @@ impl Future for BlockFuture {
         match q.can_pop() {
             true => {
                 let pop_ret = q.pop_used()?;
-                println!("[virtio] pop queue ret: {:?}", pop_ret);
                 assert_eq!(self.head, pop_ret.0);
-                let desc_link = q.descriptor_link(self.head);
-                let req_desc = desc_link[0];
                 unsafe {
-                    let req_ptr = virtio_phys_to_virt(req_desc.paddr.read() as usize);
-                    let req = &*(req_ptr as *const BlockReq);
-                    println!("[virtio] poll, req_ptr: {:#x}, req: {:#x?}", req_ptr, req);
-                    let req_nonnull_ptr = self.req.as_ref() as *const _ as usize;
-                    println!("[virtio] poll, req_nonnull_ptr: {:#x}, req: {:#x?}", req_nonnull_ptr, self.req.as_ref());
-                    let resp_nonnull_ptr = self.resp.as_ref() as *const _ as usize;
-                    println!("[virtio] poll, resp_nonnull_ptr: {:#x}, resp: {:#x?}", resp_nonnull_ptr, self.resp.as_ref());
+                    let resp = *self.resp.as_ptr();
+                    match resp.status {
+                        BlockRespStatus::Ok => {
+                            if h.ack_interrupt() {
+                                return Poll::Ready(Ok(()))
+                            } else {
+                                return Poll::Ready(Err(VirtIOError::AckInterruptError))
+                            }
+                        },
+                        _ => return Poll::Ready(Err(VirtIOError::DeciveResponseError))
+                    }
                 }
-                let intr_ret = h.ack_interrupt();
-                Poll::Ready(Ok(()))
             }
             false => {
                 // 这里不进行唤醒，直接返回 pending
