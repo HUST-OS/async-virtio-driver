@@ -252,7 +252,7 @@ impl VirtQueue {
         // read barrier
         fence(Ordering::SeqCst);
 
-        let used_ring = unsafe { self.used_ring.as_mut() };
+        let used_ring = unsafe { self.used_ring.as_ref() };
         let last_used_slot = self.last_used_index & (self.queue_size - 1);
         let index = used_ring.ring[last_used_slot as usize].id.read() as u16;
         let len = used_ring.ring[last_used_slot as usize].len.read();
