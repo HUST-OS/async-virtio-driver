@@ -63,6 +63,7 @@ impl Future for BlockFuture {
         }
         match q.can_pop() {
             true => {
+                // 更新已用环
                 let pop_ret = q.pop_used()?;
                 assert_eq!(self.head, pop_ret.0);
                 unsafe {
@@ -85,7 +86,6 @@ impl Future for BlockFuture {
                 Poll::Pending
             }
         }
-        
     }
 }
 
