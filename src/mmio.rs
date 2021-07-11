@@ -2,8 +2,6 @@
 /// ref: https://github.com/rcore-os/virtio-drivers/blob/master/src/header.rs
 /// thanks!
 /// 虚拟设备直接挂在系统总线上
-
-
 use super::config::PAGE_SIZE;
 use bitflags::*;
 use volatile::{ReadOnly, Volatile, WriteOnly};
@@ -272,7 +270,7 @@ impl VirtIOHeader {
     pub fn interrupt_status(&self) -> u32 {
         self.interrupt_status.read()
     }
-    
+
     /// Get the pointer to config space (at offset 0x100)
     pub fn config_space(&self) -> *mut u64 {
         (self as *const _ as usize + CONFIG_SPACE_OFFSET) as _

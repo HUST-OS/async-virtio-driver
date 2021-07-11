@@ -2,14 +2,14 @@
 #![no_std]
 #![feature(llvm_asm)]
 
-mod sbi;
-mod log;
-mod config;
-mod util;
-mod dma;
-pub mod queue;
-pub mod mmio;
 pub mod block;
+mod config;
+mod dma;
+mod log;
+pub mod mmio;
+pub mod queue;
+mod sbi;
+mod util;
 
 extern crate alloc;
 
@@ -40,5 +40,5 @@ pub enum VirtIOError {
     /// 回应设备外部中断错误
     AckInterruptError,
     /// 设备回应错误
-    DeciveResponseError
+    DeciveResponseError,
 }

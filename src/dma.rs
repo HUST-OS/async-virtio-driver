@@ -1,12 +1,11 @@
+use super::config::*;
+use super::*;
 /// "DMA" 实现
 /// ref: https://github.com/rcore-os/virtio-drivers/blob/master/src/hal.rs
 /// thanks!
-
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use super::config::*;
-use super::*;
 
 type VirtualAddress = usize;
 type PhysicalAddress = usize;
@@ -29,13 +28,15 @@ extern "C" {
 
 pub struct DMAAllocFuture {
     pages: u32,
-    count: u32
+    count: u32,
 }
 
 impl Future for DMAAllocFuture {
     type Output = DMA;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.count > MAX_DMA_ALLOC_COUNT { panic!("[virtio] no memory space avaiable for dma"); }
+        if self.count > MAX_DMA_ALLOC_COUNT {
+            panic!("[virtio] no memory space avaiable for dma");
+        }
         let paddr = unsafe { virtio_dma_alloc(self.pages as usize) };
         match paddr {
             0 => {
@@ -43,14 +44,10 @@ impl Future for DMAAllocFuture {
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
-            pa => {
-                Poll::Ready(
-                    DMA {
-                        paddr: pa,
-                        pages: self.pages as usize
-                    }
-                )
-            }
+            pa => Poll::Ready(DMA {
+                paddr: pa,
+                pages: self.pages as usize,
+            }),
         }
     }
 }
@@ -65,17 +62,14 @@ impl DMA {
         if paddr == 0 {
             return Err(VirtIOError::DMAAllocError);
         }
-        Ok(DMA {
-            paddr,
-            pages,
-        })
+        Ok(DMA { paddr, pages })
     }
-    
+
     /// 向操作系统内核申请分配 DMA 空间
     pub fn alloc(pages: usize) -> DMAAllocFuture {
         DMAAllocFuture {
             pages: pages as u32,
-            count: 0
+            count: 0,
         }
     }
 
@@ -97,7 +91,8 @@ impl DMA {
     /// 转换成 buffer
     pub unsafe fn as_buf(&self) -> &'static mut [u8] {
         core::slice::from_raw_parts_mut(
-            self.start_virtual_address() as _, PAGE_SIZE * self.pages as usize
+            self.start_virtual_address() as _,
+            PAGE_SIZE * self.pages as usize,
         )
     }
 }
@@ -105,9 +100,7 @@ impl DMA {
 /// DMA 在生命周期结束的时候需要在内核里面回收相应的内存空间
 impl Drop for DMA {
     fn drop(&mut self) {
-        let err = unsafe {
-            virtio_dma_dealloc(self.paddr, self.pages)
-        };
+        let err = unsafe { virtio_dma_dealloc(self.paddr, self.pages) };
         assert_eq!(err, 0, "[virtio] failed to deallocate DMA");
     }
 }
