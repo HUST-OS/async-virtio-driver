@@ -93,7 +93,12 @@ unsafe impl Send for BlockFuture {}
 unsafe impl Sync for BlockFuture {}
 
 /// 虚拟块设备
-pub struct VirtIOBlock {
+/// 常量泛型参数：一个块中的扇区数
+/// 
+/// 扇区 vs 块：
+/// * 扇区是存储介质的最小存储单位，是物理上的概念
+/// * 块是文件系统的最小存储单位，是逻辑上的概念
+pub struct VirtIOBlock<const N: usize> {
     /// 块设备的内部内容
     lock_inner: Arc<Mutex<VirtIOBlockInner>>,
     /// 不上锁的 inner，只读，用于中断处理的时候读取相应的状态
@@ -101,12 +106,14 @@ pub struct VirtIOBlock {
     /// todo: 不要通过 NonNull 所有权和生命周期机制，采用更加 Rust 的写法
     unlock_queue: NonNull<VirtQueue>,
     /// 容量
-    capacity: usize
+    capacity: usize,
+    /// 扇区大小
+    sector_size: u32
 }
 
 // todo: 尽量让 VirtIOBlock 天然 Send 和 Sync
-unsafe impl Send for VirtIOBlock {}
-unsafe impl Sync for VirtIOBlock {}
+unsafe impl<const N: usize> Send for VirtIOBlock<N> {}
+unsafe impl<const N: usize> Sync for VirtIOBlock<N> {}
 
 /// 并发场景中经常需要 VirtIOHeader 和 VirtQueue 共同完成一些原子操作
 /// 因此把这两者放到一个结构体里面
@@ -139,9 +146,9 @@ impl VirtIOBlockInner {
     }
 }
 
-impl VirtIOBlock {
+impl<const N: usize> VirtIOBlock<N> {
     /// 以异步方式创建虚拟块设备驱动
-    pub async fn async_new(header: &'static mut VirtIOHeader) -> Result<VirtIOBlock> {
+    pub async fn async_new(header: &'static mut VirtIOHeader) -> Result<VirtIOBlock<N>> {
         if !header.verify() {
             return Err(VirtIOError::HeaderVerifyError);
         }
@@ -179,7 +186,8 @@ impl VirtIOBlock {
         Ok(VirtIOBlock {
             lock_inner,
             unlock_queue: NonNull::new(queue_ptr).unwrap(),
-            capacity: config.capacity.read() as usize
+            capacity: config.capacity.read() as usize,
+            sector_size: config.sector_size.read()
         })
     }
 
@@ -221,6 +229,7 @@ impl VirtIOBlock {
             lock_inner,
             unlock_queue: NonNull::new(queue_ptr).unwrap(),
             capacity: config.capacity.read() as usize,
+            sector_size: config.sector_size.read()
         })
     }
 
@@ -229,15 +238,16 @@ impl VirtIOBlock {
         self.lock_inner.lock().header.ack_interrupt()
     }
 
-    /// 以异步方式读取一个块
+    /// 以异步方式读取一个扇区
     /// todo: 仔细考虑这里的操作原子性
-    pub fn async_read(&self, block_id: usize, buf: &mut [u8]) -> BlockFuture {
-        if buf.len() != BLOCK_SIZE {
-            panic!("[virtio] buffer size must equal to block size - 512!");
+    pub fn async_read_sector(&self, sector_id: usize, buf: &mut [u8]) -> BlockFuture {
+        // 缓冲区大小必须等于扇区大小
+        if buf.len() != self.sector_size as usize {
+            panic!("[virtio] buffer size must equal to sector size - {}!", self.sector_size);
         }
         let mut inner = self.lock_inner.lock();
         let (_h, q, reqs, resps) = inner.header_queue_req_resp_mut();
-        println!("virt queue ptr: {:#x}", q as *const _ as usize);
+
         // 空闲描述符表的头部
         let free_head = q.free_head();
         
@@ -245,7 +255,7 @@ impl VirtIOBlock {
         let req = &mut reqs[free_head as usize];
         req.type_ = BlockReqType::In;
         req.reserved = 0;
-        req.sector = block_id as u64;
+        req.sector = sector_id as u64;
         
         // IO 回应
         let resp = &mut resps[free_head as usize];
@@ -267,11 +277,11 @@ impl VirtIOBlock {
         }
     }
 
-    /// 以异步方式写入一个块
+    /// 以异步方式写入一个扇区
     /// todo: 仔细考虑这里的操作原子性
-    pub fn async_write(&self, block_id: usize, buf: &[u8]) -> BlockFuture {
-        if buf.len() != BLOCK_SIZE {
-            panic!("[virtio] buffer size must equal to block size - 512!");
+    pub fn async_write_sector(&self, sector_id: usize, buf: &[u8]) -> BlockFuture {
+        if buf.len() != self.sector_size as usize {
+            panic!("[virtio] buffer size must equal to sector size - {}!", self.sector_size);
         }
         
         let mut inner = self.lock_inner.lock();
@@ -284,7 +294,7 @@ impl VirtIOBlock {
         let req = &mut reqs[free_head as usize];
         req.type_ = BlockReqType::Out;
         req.reserved = 0;
-        req.sector = block_id as u64;
+        req.sector = sector_id as u64;
         
         // IO 回应
         let resp = &mut resps[free_head as usize];
@@ -297,7 +307,6 @@ impl VirtIOBlock {
         
         // 不在这里通知设备，在 BlockFuture 第一次 poll 的时候通知
         // h.notify(0);
-        
         BlockFuture {
             inner: Arc::clone(&self.lock_inner),
             head,
@@ -307,19 +316,46 @@ impl VirtIOBlock {
         }
     }
 
+    /// 异步方式读取一个块
+    pub async fn async_read_block(&self, sector_id: usize, buf: &mut [u8]) -> Result<()> {
+        // 块大小 = 一个块中的扇区数 * 扇区大小
+        let block_size = self.sector_size as usize * N; 
+        if buf.len() != block_size {
+            panic!("[virtio] buffer size must equal to block size - {}!", block_size);
+        }
+        for (idx, b) in buf.chunks_mut(self.sector_size as usize).enumerate() {
+            self.async_read_sector(sector_id + idx, b).await?;
+        }
+        Ok(())
+    }
+
+    /// 异步方式写入一个块
+    pub async fn async_write_block(&self, sector_id: usize, buf: &[u8]) -> Result<()> {
+        // 块大小 = 一个块中的扇区数 * 扇区大小
+        let block_size = self.sector_size as usize * N; 
+        if buf.len() != block_size {
+            panic!("[virtio] buffer size must equal to block size - {}!", block_size);
+        }
+        for (idx, b) in buf.chunks(self.sector_size as usize).enumerate() {
+            self.async_write_sector(sector_id + idx, b).await?;
+        }
+        Ok(())
+    }
+
     /// unused
-    pub fn read_block(&self, block_id: usize, buf: &mut [u8]) -> Result<()> {
-        if buf.len() != BLOCK_SIZE {
-            panic!("[virtio] buffer size must equal to block size - 512!");
+    pub fn read_sector(&self, block_id: usize, buf: &mut [u8]) -> Result<()> {
+        // 缓冲区大小必须等于扇区大小
+        if buf.len() != self.sector_size as usize {
+            panic!("[virtio] buffer size must equal to sector size - {}!", self.sector_size);
         }
         let req = BlockReq {
             type_: BlockReqType::In,
             reserved: 0,
             sector: block_id as u64,
         };
+        let mut inner = self.lock_inner.lock();
         let mut resp = BlockResp::default();
 
-        let mut inner = self.lock_inner.lock();
         let (h, q) = inner.header_and_queue_mut();
 
         q.add_buf(&[req.as_buf()], &[buf, resp.as_buf_mut()])
@@ -336,18 +372,19 @@ impl VirtIOBlock {
     }
 
     /// unused
-    pub fn write_block(&self, block_id: usize, buf: &[u8]) -> Result<()> {
-        if buf.len() != BLOCK_SIZE {
-            panic!("[virtio] buffer size must equal to block size - 512!");
+    pub fn write_sector(&self, block_id: usize, buf: &[u8]) -> Result<()> {
+        // 缓冲区大小必须等于扇区大小
+        if buf.len() != self.sector_size as usize {
+            panic!("[virtio] buffer size must equal to sector size - {}!", self.sector_size);
         }
         let req = BlockReq {
             type_: BlockReqType::Out,
             reserved: 0,
             sector: block_id as u64,
         };
+        let mut inner = self.lock_inner.lock();
         let mut resp = BlockResp::default();
         
-        let mut inner = self.lock_inner.lock();
         let (h, q) = inner.header_and_queue_mut();
 
         q.add_buf(&[req.as_buf(), buf], &[resp.as_buf_mut()])
