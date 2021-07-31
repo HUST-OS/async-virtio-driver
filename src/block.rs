@@ -4,6 +4,7 @@ use super::queue::VirtQueue;
 use super::util::AsBuf;
 use super::*;
 use alloc::sync::Arc;
+use event::Event;
 /// 虚拟块设备前端驱动
 /// ref: https://github.com/rcore-os/virtio-drivers/blob/master/src/blk.rs
 /// thanks!
@@ -106,6 +107,7 @@ pub struct VirtIOBlock<const N: usize> {
     capacity: usize,
     /// 扇区大小
     sector_size: u32,
+    pub wake_ops: Event
 }
 
 // todo: 尽量让 VirtIOBlock 天然 Send 和 Sync
@@ -202,6 +204,7 @@ impl<const N: usize> VirtIOBlock<N> {
             unlock_queue: NonNull::new(queue_ptr).unwrap(),
             capacity: config.capacity.read() as usize,
             sector_size: config.sector_size.read(),
+            wake_ops: Event::new()
         })
     }
 
@@ -249,6 +252,7 @@ impl<const N: usize> VirtIOBlock<N> {
             unlock_queue: NonNull::new(queue_ptr).unwrap(),
             capacity: config.capacity.read() as usize,
             sector_size: config.sector_size.read(),
+            wake_ops: Event::new()
         })
     }
 
@@ -344,7 +348,7 @@ impl<const N: usize> VirtIOBlock<N> {
     }
 
     /// 异步方式读取一个块
-    pub async fn async_read_block(&self, sector_id: usize, buf: &mut [u8]) -> Result<()> {
+    pub async fn async_read_block(&self, block_id: usize, buf: &mut [u8]) -> Result<()> {
         // 块大小 = 一个块中的扇区数 * 扇区大小
         let block_size = self.sector_size as usize * N;
         if buf.len() != block_size {
@@ -354,13 +358,13 @@ impl<const N: usize> VirtIOBlock<N> {
             );
         }
         for (idx, b) in buf.chunks_mut(self.sector_size as usize).enumerate() {
-            self.async_read_sector(sector_id + idx, b).await?;
+            self.async_read_sector(block_id + idx, b).await?;
         }
         Ok(())
     }
 
     /// 异步方式写入一个块
-    pub async fn async_write_block(&self, sector_id: usize, buf: &[u8]) -> Result<()> {
+    pub async fn async_write_block(&self, block_id: usize, buf: &[u8]) -> Result<()> {
         // 块大小 = 一个块中的扇区数 * 扇区大小
         let block_size = self.sector_size as usize * N;
         if buf.len() != block_size {
@@ -370,11 +374,109 @@ impl<const N: usize> VirtIOBlock<N> {
             );
         }
         for (idx, b) in buf.chunks(self.sector_size as usize).enumerate() {
-            self.async_write_sector(sector_id + idx, b).await?;
+            self.async_write_sector(block_id + idx, b).await?;
         }
         Ok(())
     }
 
+    pub async fn read_sector_event(&self, sector_id: usize, buf: &mut [u8]) -> Result<()> {
+        // 开始监听
+        let listener = self.wake_ops.listen();
+        // 缓冲区大小必须等于扇区大小
+        if buf.len() != self.sector_size as usize {
+            panic!(
+                "[virtio] buffer size must equal to sector size - {}!",
+                self.sector_size
+            );
+        }
+        let req = BlockReq {
+            type_: BlockReqType::In,
+            reserved: 0,
+            sector: sector_id as u64,
+        };
+        let mut inner = self.lock_inner.lock();
+        let mut resp = BlockResp::default();
+
+        let (h, q) = inner.header_and_queue_mut();
+
+        q.add_buf(&[req.as_buf()], &[buf, resp.as_buf_mut()])
+            .expect("[virtio] virtual queue add buf error");
+
+        h.notify(0);
+
+        listener.await;
+        
+        q.pop_used()?;
+        match resp.status {
+            BlockRespStatus::Ok => Ok(()),
+            _ => Err(VirtIOError::IOError),
+        }
+    }
+
+    pub async fn write_serctor_event(&self, sector_id: usize, buf: &[u8]) -> Result<()> {
+        // 开始监听
+        let listener = self.wake_ops.listen();
+        // 缓冲区大小必须等于扇区大小
+        if buf.len() != self.sector_size as usize {
+            panic!(
+                "[virtio] buffer size must equal to sector size - {}!",
+                self.sector_size
+            );
+        }
+        let req = BlockReq {
+            type_: BlockReqType::Out,
+            reserved: 0,
+            sector: sector_id as u64,
+        };
+        let mut inner = self.lock_inner.lock();
+        let mut resp = BlockResp::default();
+
+        let (h, q) = inner.header_and_queue_mut();
+
+        q.add_buf(&[req.as_buf(), buf], &[resp.as_buf_mut()])
+            .expect("[virtio] virtual queue add buf error");
+
+        h.notify(0);
+
+        listener.await;
+        
+        q.pop_used()?;
+        match resp.status {
+            BlockRespStatus::Ok => Ok(()),
+            _ => Err(VirtIOError::IOError),
+        }
+    }
+
+    pub async fn read_block_event(&self, block_id: usize, buf: &mut [u8]) -> Result<()> {
+        // 块大小 = 一个块中的扇区数 * 扇区大小
+        let block_size = self.sector_size as usize * N;
+        if buf.len() != block_size {
+            panic!(
+                "[virtio] buffer size must equal to block size - {}!",
+                block_size
+            );
+        }
+        for (idx, b) in buf.chunks_mut(self.sector_size as usize).enumerate() {
+            self.read_sector_event(block_id + idx, b).await?;
+        }
+        Ok(())
+    }
+    
+    pub async fn write_block_event(&self, block_id: usize, buf: &[u8]) -> Result<()> {
+        // 块大小 = 一个块中的扇区数 * 扇区大小
+        let block_size = self.sector_size as usize * N;
+        if buf.len() != block_size {
+            panic!(
+                "[virtio] buffer size must equal to block size - {}!",
+                block_size
+            );
+        }
+        for (idx, b) in buf.chunks(self.sector_size as usize).enumerate() {
+            self.write_serctor_event(block_id + idx, b).await?;
+        }
+        Ok(())
+    }
+    
     /// unused
     pub fn read_sector(&self, block_id: usize, buf: &mut [u8]) -> Result<()> {
         // 缓冲区大小必须等于扇区大小
